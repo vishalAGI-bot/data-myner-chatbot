@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+# Data exports can contain personal data and tokens - never commit them.
+data/
+# Connection settings saved from the web Settings page (contain passwords).
+config/

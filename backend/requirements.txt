@@ -1,0 +1,25 @@
+requests>=2.31.0
+openai>=2.0.0,<3
+rapidfuzz>=3.9.0
+streamlit>=1.35.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.12
+
+numpy>=1.24.0          # journey similarity search (vectorised)
+
+# Optional: streams very large JSON arrays with lower memory use
+# ijson>=3.2
+
+# Data analyst (analyst/)
+psycopg[binary]>=3.2
+paramiko>=3.4          # SSH tunnel (analyst/ssh_tunnel.py)
+python-dotenv>=1.0
+sqlglot>=25
+duckdb>=1.1                # offline snapshot mode
+pytz                       # timezone-aware timestamps in DuckDB
+pyyaml>=6
+
+# Tests only: a throwaway real PostgreSQL for the analyst tests
+# pgserver>=0.1
+# pytest>=8

@@ -1,0 +1,151 @@
+"""Visit questions: routing, ambiguity handling in Deep mode, and database-error handling."""
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+from analyst.agent import AnalystAgent, _grain_mismatch, _metric_by_app
+from analyst.catalog import Catalog
+from analyst.settings import Settings
+from analyst.sources import Result, SourceError
+
+KNOWLEDGE = Path(__file__).resolve().parents[1] / "analyst" / "knowledge"
+
+
+class VisitSource:
+    dialect = "postgres"
+    kind = "stub"
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+
+    def query(self, sql, **_):
+        if self.fail:
+            raise SourceError("canceling statement due to statement timeout")
+        if "AS day" in sql:
+            return Result(["day", "visits"], [["2026-09-06", 279], ["2026-09-07", 2826]])
+        if "visits_per_user" in sql:
+            return Result(["visits", "users", "visits_per_user", "apps", "avg_visit_minutes", "period_start",
+                           "period_end"], [[1200, 300, 4.0, 9, 3.5, "2026-09-06 00:00:00", "2026-09-30 10:00:00"]])
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+
+def make_agent(source=None) -> AnalystAgent:
+    catalog = Catalog(KNOWLEDGE, "Amazon")
+    catalog.apps = ["Amazon", "Meesho", "Flipkart"]
+    catalog.date_range = ("2026-09-06", "2026-09-30")
+    for table in catalog.tables.values():
+        table.available = True
+    for metric in catalog.metrics.values():
+        metric.available = True
+    return AnalystAgent(source or VisitSource(), catalog, Settings(source="snapshot"))
+
+
+def test_visit_questions_route_to_totals_without_breaking_per_app_routes():
+    agent = make_agent()
+    expected = {
+        "how many total user visit?": "visits_overview",
+        "total visits": "visits_overview",
+        "how many sessions per app": "session_summary_by_app",
+        "how many users visited Amazon in the last 24 hours": "active_users_by_app",
+        "which app had the most unique users yesterday": "active_users_by_app",
+    }
+    for question, metric in expected.items():
+        route, _ = agent.router.route(question)
+        assert route.metric is not None and route.metric.name == metric, question
+
+
+def test_per_app_request_needs_a_per_app_metric():
+    cat = make_agent().cat
+    assert not _metric_by_app(cat.metrics["visits_overview"])
+    assert _metric_by_app(cat.metrics["leakage_destinations"])        # positional GROUP BY 1 on an app column
+    assert _metric_by_app(cat.metrics["app_list"])
+    assert _grain_mismatch("total visits by app", cat.metrics["visits_overview"])
+    assert not _grain_mismatch("total visits across all apps", cat.metrics["visits_overview"])
+
+
+def test_total_visits_answer_offline():
+    result = make_agent().ask("how many total user visit?", depth="fast")
+    assert result.metric == "visits_overview" and result.verified
+    assert "visits: 1,200" in result.answer and "users: 300" in result.answer
+
+
+def test_database_error_in_vetted_metric_is_an_answer_not_a_crash():
+    result = make_agent(VisitSource(fail=True)).ask("total visits", depth="fast")
+    assert result.route == "error" and not result.verified
+    assert "failed on the database" in result.answer
+
+
+def _deep_model(plan: dict):
+    def complete(system="", user="", **_):
+        if system.startswith("You are the lead analyst"):
+            return json.dumps(plan)
+        if system.startswith("You write ONE PostgreSQL"):
+            return json.dumps({"sql": "SELECT COUNT(*) AS journeys FROM cross_app_journey"})
+        if system.startswith("Review a proposed"):
+            return json.dumps({"blocking_issues": ["counts journeys, not visits"], "minor_issues": []})
+        if system.startswith("Verify an analytics answer"):
+            return json.dumps({"valid": True, "issues": []})
+        return "Visits were counted from sessions."
+    return complete
+
+
+def test_deep_falls_back_to_vetted_metric_when_no_custom_query_is_approved():
+    agent = make_agent()
+    plan = {"action": "custom_sql", "tables": ["session_master"], "reason": "custom count",
+            "interpretation": "Visits are sessions in session_master across all apps and all data."}
+    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=_deep_model(plan)):
+        result = agent.ask("how many total user visit?", depth="deep", max_seconds=120)
+    assert result.metric == "visits_overview" and result.verified, result.answer
+    assert "Interpreted as: Visits are sessions" in result.answer
+    assert any("closest vetted analysis" in step["text"] for step in result.thinking)
+
+
+def test_deep_unsupported_answer_states_the_reason():
+    agent = make_agent()
+    plan = {"action": "unsupported", "reason": "no field", "message": "City tier is not recorded",
+            "interpretation": "Visits by city tier."}
+    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=_deep_model(plan)):
+        result = agent.ask("visits by city tier", depth="deep")
+    assert result.route == "data_gap" and "City tier is not recorded." in result.answer
+
+
+def test_metric_grain_reads_output_columns_only():
+    from analyst.agent import _metric_grain
+    cat = make_agent().cat
+    assert _metric_grain(cat.metrics["visits_overview"]) is None       # CAST(... AS date) inside a CTE
+    assert _metric_grain(cat.metrics["active_users_by_app"]) is None
+    assert _metric_grain(cat.metrics["purchase_share_trend"]) == "day"  # bare "day" output column
+    assert _grain_mismatch("day wise visits", cat.metrics["visits_overview"])
+
+
+def test_plan_without_action_is_normalised():
+    from analyst.agent import _normalise_plan
+    cat = make_agent().cat
+    assert _normalise_plan({"metric": "visits_overview", "reason": "r"}, cat)["action"] == "metric"
+    assert _normalise_plan({"strategy": {"action": "sql", "tables": ["session_master"]}}, cat)["action"] == "custom_sql"
+    assert _normalise_plan({"reason": "nothing"}, cat)["action"] is None
+
+
+def test_rejected_summary_is_dropped_and_table_reverified():
+    agent = make_agent()
+    verdicts = iter([{"valid": False, "issues": ["the summary names the wrong peak day"]},
+                     {"valid": True, "issues": []}])
+
+    def complete(system="", user="", **_):
+        if system.startswith("You are the lead analyst"):
+            return json.dumps({"action": "custom_sql", "tables": ["session_master"], "reason": "day grain",
+                               "interpretation": "Visits are sessions per day."})
+        if system.startswith("You write ONE PostgreSQL"):
+            return json.dumps({"sql": "SELECT CAST(created_at AS date) AS day, COUNT(*) AS visits "
+                                      "FROM session_master GROUP BY 1 ORDER BY 1"})
+        if system.startswith("Review a proposed"):
+            return json.dumps({"blocking_issues": [], "minor_issues": []})
+        if system.startswith("Verify an analytics answer"):
+            return json.dumps(next(verdicts))
+        return "Visits peaked on 2026-09-06."
+
+    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=complete):
+        result = agent.ask("day wise visits", depth="deep", max_seconds=120)
+    assert result.verified and result.answer.startswith("Result:"), result.answer
+    assert "peaked" not in result.answer and "2026-09-07: visits 2,826" in result.answer
