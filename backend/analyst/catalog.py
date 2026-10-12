@@ -7,6 +7,7 @@ are documented AND present AND not blocked are visible to the chatbot.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 import statistics
@@ -25,6 +26,11 @@ _SENSITIVE = re.compile(r"(password|passwd|secret|token|api_?key|e_?mail|mobile|
                         r"last_name|username|device_id|fcm|hash|otp|aadhaar|pan_number|ip_address)", re.I)
 _HEAVY = re.compile(r"(embedding|payload|raw_|_text$|content$|metadata|response|prompt)", re.I)
 _AGG_ONLY = re.compile(r"(date_of_birth|dob|pincode|pin_code|zip)", re.I)
+CATEGORY_LEVELS = ("master_category", "category", "sub_category")
+
+# Who "we / us / our" is for the question being answered, when the asker says so ("I'm Flipkart's insights
+# lead"). Set per request by the agent; every reader of Catalog.home_app sees it, nothing else changes.
+HOME_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar("analyst_home_app", default=None)
 
 
 @dataclass
@@ -58,7 +64,7 @@ class TableDoc:
 @dataclass
 class Param:
     name: str
-    type: str                     # int | date | app | text | enum
+    type: str                     # int | date | app | text | enum | list
     default: object = None
     values: list[str] = field(default_factory=list)
 
@@ -77,6 +83,7 @@ class MetricDoc:
     dimensions: dict[str, str] = field(default_factory=dict)
     focus_parameter: str | None = None
     available: bool = True
+    combine_dimensions: bool = False      # dimension may be "a+b" (two allow-listed dimensions crossed)
 
     def param(self, name: str) -> Param | None:
         return next((p for p in self.params if p.name == name), None)
@@ -123,6 +130,12 @@ class Catalog:
     def __init__(self, knowledge_dir: Path, home_app: str = ""):
         self.dir = Path(knowledge_dir)
         self.home_app = home_app
+        self.app_parents: dict[str, str] = {}             # sub-app -> its main app ("Amazon Now" -> "Amazon")
+        # Exact category value -> the taxonomy levels it occurs at (master_category / category / sub_category).
+        self.category_levels: dict[str, set[str]] = {}
+        self.category_tree: dict[str, list[str]] = {}     # master category -> its categories
+        # Every (master, category, sub-category) row: names such as "Others" recur under several parents.
+        self.category_paths: list[tuple[str, str, str]] = []
         self.tables: dict[str, TableDoc] = {}
         self.metrics: dict[str, MetricDoc] = {}
         self.blocked_tables: set[str] = set()
@@ -177,7 +190,17 @@ class Catalog:
                 tags=[str(t).lower() for t in meta.get("tags", [])], tables=meta.get("tables", []), params=params,
                 sql=sql.group(1).strip(), questions=_bullets(_section(body, "Example questions")),
                 caveats=_section(body, "Caveats"), dimensions=meta.get("dimensions") or {},
-                focus_parameter=meta.get("focus_parameter"))
+                focus_parameter=meta.get("focus_parameter"),
+                combine_dimensions=bool(meta.get("combine_dimensions")))
+
+    # ------------------------------------------------------------ home app
+    @property
+    def home_app(self) -> str:
+        return HOME_OVERRIDE.get() or self._home_app
+
+    @home_app.setter
+    def home_app(self, value: str) -> None:
+        self._home_app = value
 
     # ------------------------------------------------------- live database
     def attach(self, source: Source) -> None:
@@ -218,13 +241,44 @@ class Catalog:
             log.warning("row counts unavailable: %s", exc)
 
         apps = self._values(source, "SELECT DISTINCT app_name FROM app_master WHERE app_name IS NOT NULL", "app_master")
+        parents = {}
+        if self._has("app_master", "parent_id"):
+            try:
+                parents = {str(a): str(p) for a, p in source.query(
+                    "SELECT a.app_name, p.app_name FROM app_master a JOIN app_master p ON p.id = a.parent_id "
+                    "WHERE a.app_name IS NOT NULL AND p.app_name IS NOT NULL", max_rows=5000).rows}
+            except SourceError as exc:
+                log.warning("could not read sub-apps: %s", exc)
         cats = []
+        levels: dict[str, set[str]] = {}
         if self._has("category_master"):
-            for col in ("master_category", "category", "sub_category"):
-                cats += self._values(source, f"SELECT DISTINCT {col} FROM category_master WHERE {col} IS NOT NULL", "category_master")
+            for col in CATEGORY_LEVELS:
+                values = self._values(
+                    source, f"SELECT DISTINCT {col} FROM category_master WHERE {col} IS NOT NULL", "category_master")
+                cats += values
+                for v in values:
+                    if isinstance(v, str) and v.strip():
+                        levels.setdefault(v, set()).add(col)
+        tree: dict[str, list[str]] = {}
+        paths: list[tuple[str, str, str]] = []
+        if all(self._has("category_master", c) for c in CATEGORY_LEVELS):
+            try:
+                paths = [(str(m), str(c), str(s)) for m, c, s in source.query(
+                    "SELECT DISTINCT master_category, category, sub_category FROM category_master "
+                    "WHERE master_category IS NOT NULL AND category IS NOT NULL AND sub_category IS NOT NULL "
+                    "ORDER BY master_category, category, sub_category", max_rows=20000).rows]
+            except SourceError as exc:
+                log.warning("could not read the category tree: %s", exc)
+            for master, category, _ in paths:
+                if category not in tree.setdefault(master, []):
+                    tree[master].append(category)
         if self._has("journey_window", "search_category"):
             cats += self._values(source, "SELECT DISTINCT search_category FROM journey_window WHERE search_category IS NOT NULL", "journey_window")
         self.apps = apps
+        self.app_parents = parents
+        self.category_levels = levels
+        self.category_tree = tree
+        self.category_paths = paths
         self.categories = sorted({c for c in cats if isinstance(c, str) and c.strip()})
         if self._has("cross_app_journey", "first_search_time"):
             try:

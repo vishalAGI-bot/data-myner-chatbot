@@ -76,9 +76,11 @@ def openai_stub(plan: dict, verdict: str = "Not a spike: it is steady."):
     return patch.multiple("llm", complete=complete), patch.object(config, "LLM_PROVIDER", "openai")
 
 
-def ask_deep(agent, question, plan, verdict="Not a spike: it is steady."):
+def ask_deep(agent, question, plan, verdict="Not a spike: it is steady.", understood: dict | None = None):
+    """Deep mode with OpenAI's reading of the question (``understood``) and a fixed strategy."""
     model, provider = openai_stub(plan, verdict)
-    with model, provider:
+    reading = {"rephrased_question": question, "intent": "analysis", **(understood or {})}
+    with model, provider, patch("llm.call_tool", return_value=reading):
         return agent.ask(question, depth="deep")
 
 
@@ -89,7 +91,8 @@ def test_deep_comparison_highlights_apps_instead_of_filtering():
                       {"action": "metric", "metric": "time_to_purchase_by_app",
                        "params": {"app": "Amazon, Meesho, Flipkart", "window_hours": 72}},
                       verdict="Amazon is fastest in the 72-hour window: 2.5 average hours vs 3.2 for Meesho "
-                              "and 4.1 for Flipkart.")
+                              "and 4.1 for Flipkart.",
+                      understood={"focus_app": "Amazon", "apps": ["Amazon", "Meesho", "Flipkart"]})
     assert result.route == "metric" and result.metric == "time_to_purchase_by_app" and result.verified
     assert result.depth == "deep" and "app" not in result.params
     assert "a.app_name =" not in result.sql
@@ -161,7 +164,10 @@ def test_deep_spike_question_keeps_the_whole_period_and_answers_with_a_verdict()
                       {"action": "metric", "metric": "search_category_trend",
                        "params": {"category": "Women's Traditional Wear", "date_from": "2026-09-24",
                                   "date_to": "2026-10-01"}},
-                      verdict="Not a spike: Women's Traditional Wear averaged 17% this week vs 15% before.")
+                      verdict="Not a spike: Women's Traditional Wear averaged 17% this week vs 15% before.",
+                      understood={"date_from": "2026-09-28", "date_to": "2026-09-29",
+                                  "categories": [{"asked": "Women's Traditional Wear",
+                                                  "matches": ["Women's Traditional Wear"]}]})
     assert "date_from" not in result.params and "date_to" not in result.params
     assert result.answer.startswith("**Answer:** Not a spike: Women's Traditional Wear averaged 17%")
     assert "Only days from 2026-09-17 are compared" in result.answer
@@ -479,11 +485,10 @@ def test_deep_mode_obeys_the_same_shape_guard_as_the_router():
     resolved = "Give me the user IDs and available user details of users who visited app 0005"
     assert _grain_mismatch(resolved, catalog.metrics["top_users_by_visits"], "and add user id"), \
         "the guard must reject this metric for an add-a-column follow-up"
-    # ... and the Deep planner must consult it: the branch that accepts OpenAI's metric calls
-    # _grain_mismatch before using it.
+    # ... and the Deep planner must consult the shape guard before using the metric OpenAI picks.
     source = (Path(__file__).resolve().parents[1] / "analyst" / "agent.py").read_text(encoding="utf-8")
     deep = source.split("def _deep(")[1].split("def _deep_plan(")[0]
-    assert "_grain_mismatch(question, picked, original)" in deep, \
+    assert "self._wrong_shape(question, picked, original)" in deep, \
         "Deep mode must apply the shape guard to the metric OpenAI picks"
 
 

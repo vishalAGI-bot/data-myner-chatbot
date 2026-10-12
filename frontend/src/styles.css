@@ -397,6 +397,33 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .answer-suggestions button:hover { border-color: var(--side); background: #f2f7f3; }
 
+/* "Clarification needed" (must answer) and "Suggested follow-up questions" (optional) look different on purpose. */
+.answer-section-title { font-size: 12px; font-weight: 600; letter-spacing: 0.02em; color: var(--ink); margin-bottom: 6px; }
+.answer-section-title span { font-weight: 400; color: var(--muted); margin-left: 4px; }
+.follow-ups { width: min(560px, 100%); margin-top: 10px; }
+.follow-ups .answer-suggestions { margin-top: 0; }
+.clarify-box {
+  width: min(560px, 100%); margin-top: 10px; padding: 12px 14px; border: 1px solid #e6c98c;
+  border-left: 4px solid #c98a12; border-radius: 12px; background: #fffaf0;
+}
+.clarify-lead { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+.clarify-item + .clarify-item { margin-top: 12px; padding-top: 10px; border-top: 1px solid #f0e2c4; }
+.clarify-question { font-size: 14px; font-weight: 600; color: var(--ink); }
+.clarify-why { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.clarify-options { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.clarify-options button {
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d9cba8; background: #fff; color: var(--ink);
+  border-radius: 10px; padding: 7px 10px; font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+}
+.clarify-options button:hover { border-color: #c98a12; background: #fff4dc; }
+.clarify-options button.picked { border-color: #c98a12; background: #fdebc4; font-weight: 600; }
+.clarify-options button.other { color: var(--muted); border-style: dashed; }
+.option-key {
+  display: inline-grid; place-items: center; min-width: 18px; height: 18px; border-radius: 5px;
+  background: #f3e6c8; font-size: 11px; font-weight: 700;
+}
+.request-parts { margin: 4px 0; padding-left: 20px; }
+
 .notice { margin: 0 40px 8px; font-size: 12px; color: var(--muted); }
 .composer {
   margin: 8px 28px 22px 40px; display: flex; align-items: flex-end; gap: 8px;

@@ -153,7 +153,10 @@ export default function Chat(p: Props) {
           </div>
         )}
 
-        {p.messages.map((m) => <MessageBubble userMode={p.userMode} key={m.id} message={m} caption={p.info.caption} onAsk={p.onAsk} />)}
+        {p.messages.map((m) => (
+          <MessageBubble userMode={p.userMode} key={m.id} message={m} caption={p.info.caption} onAsk={p.onAsk}
+                         onDraft={(draft) => { setText(draft); requestAnimationFrame(() => inputRef.current?.focus()); }} />
+        ))}
 
         {p.running && (
           <ThinkingBubble steps={p.steps} elapsed={p.elapsed} maxSeconds={p.maxSeconds} onStop={p.onStop} />

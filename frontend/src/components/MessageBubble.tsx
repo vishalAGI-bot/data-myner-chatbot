@@ -1,12 +1,15 @@
 import { useMemo, useState, type HTMLAttributes, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { AnalystClarification, AnalystResponse } from "../api/analyst";
 import type { ResultTable, ThinkingStep } from "../api/journey";
 import type { Message } from "../types";
 import ResultChart, { chartSpec } from "./ResultChart";
 
-export default function MessageBubble({ message, caption, onAsk, userMode = false }:
-  { message: Message; caption: string; onAsk: (question: string) => void; userMode?: boolean }) {
+export default function MessageBubble({ message, caption, onAsk, onDraft, userMode = false }:
+  { message: Message; caption: string; onAsk: (question: string) => void;
+    /** Put text in the message box for the user to finish ("Other - please specify"). */
+    onDraft?: (text: string) => void; userMode?: boolean }) {
   const [open, setOpen] = useState(false);
   if (message.role === "user") {
     return (
@@ -24,7 +27,11 @@ export default function MessageBubble({ message, caption, onAsk, userMode = fals
     const secs = (meta.latency_ms / 1000).toFixed(1);
     if (meta.depth === "deep") bits.push(`thought for ${secs}s`);
     else if (meta.latency_ms >= 1000) bits.push(`${secs}s`);
-    if (a?.depth === "deep" && a.parts.length) {
+    const questions = a ? a.parts.filter((part) => part.status) : [];
+    if (questions.length) {
+      const answered = questions.filter((part) => part.status === "answered" || part.status === "flagged").length;
+      bits.push(`${answered} of ${questions.length} questions answered`);
+    } else if (a?.depth === "deep" && a.parts.length) {
       const supported = a.parts.filter((part) => part.verified).length;
       bits.push(`${supported} of ${a.parts.length} parts supported`);
     } else if (j?.depth === "deep" && j.route !== "data_gap") {
@@ -52,6 +59,19 @@ export default function MessageBubble({ message, caption, onAsk, userMode = fals
     <div className="row assistant">
       <div className={`bubble ${message.error ? "error" : ""}`}><AnswerText text={visibleAnswer} /></div>
       {inlineTable && <TableField table={meta.table!} inline />}
+      {(a?.clarifications?.length ?? 0) > 0 && (
+        <Clarifications items={a!.clarifications!} onAsk={onAsk} onDraft={onDraft} />
+      )}
+      {(a?.follow_ups?.length ?? 0) > 0 && (
+        <section className="follow-ups" aria-label="Suggested follow-up questions">
+          <div className="answer-section-title">Suggested follow-up questions <span>optional</span></div>
+          <div className="answer-suggestions">
+            {a!.follow_ups!.map((question) => (
+              <button type="button" key={question} onClick={() => onAsk(question)}>{question}</button>
+            ))}
+          </div>
+        </section>
+      )}
       {(meta?.suggested_questions?.length ?? 0) > 0 && (
         <div className="answer-suggestions" aria-label="Available questions">
           {meta!.suggested_questions.slice(0, 4).map((question) => (
@@ -86,6 +106,7 @@ export default function MessageBubble({ message, caption, onAsk, userMode = fals
       {open && a && userMode && (
         <div className="details">
           <Field label="Understood as">{a.resolved || "your question"}</Field>
+          <RequestField request={a.request} />
           {scope.length > 0 && <Field label="Applied to">{scope.join(" · ")}</Field>}
           {a.parts.length > 0 && (
             <Field label={`Answered in ${a.parts.length} parts`}>
@@ -112,6 +133,7 @@ export default function MessageBubble({ message, caption, onAsk, userMode = fals
             )}
             <span className="muted"> · {a.source === "rules" ? "matched without the language model" : "chosen with the language model"}</span>
           </Field>
+          <RequestField request={a.request} />
           {a.tables.length > 0 && <Field label="Tables used">{a.tables.join(", ")}</Field>}
           <Thinking steps={a.thinking} />
           {a.parts.length > 0 && (
@@ -120,7 +142,7 @@ export default function MessageBubble({ message, caption, onAsk, userMode = fals
                 {a.parts.map((part, i) => (
                   <li key={i} className={part.verified ? "supported" : "unsupported"}>
                     <strong>{part.question}</strong>
-                    <span className="part-status">{part.verified ? "Supported" : "Not supported"}</span>
+                    <span className="part-status">{part.label ?? (part.verified ? "Supported" : "Not supported")}</span>
                     {part.understood_as && <div className="muted">Understood as: {part.understood_as}</div>}
                     {part.answer && <div className="part-answer"><AnswerText text={part.answer} /></div>}
                     {part.sql && <pre className="code">{part.sql}</pre>}
@@ -207,6 +229,7 @@ function answerStatus(a: NonNullable<Message["analyst"]>): { label: string; tone
   if (a.route === "out_of_scope") return { label: "Outside data-analysis scope", tone: "warn" };
   if (a.route === "unsupported" || a.route === "help") return { label: "Not supported by this data", tone: "warn" };
   if (a.route === "error" || a.route === "timeout") return { label: "Not verified", tone: "bad" };
+  if (a.clarifications?.length) return { label: "Partial answer · needs clarification", tone: "warn" };
   if (a.parts.length) {
     const supported = a.parts.filter((part) => part.verified).length;
     return supported === a.parts.length && supported > 0
@@ -309,6 +332,66 @@ function downloadCsv(table: ResultTable) {
   link.download = "datamyner-result.csv";
   link.click();
   URL.revokeObjectURL(url);
+}
+
+const OPTION_KEYS = "ABCD";
+
+/** Questions the user must answer. With several, the picks are sent together as one reply. */
+function Clarifications({ items, onAsk, onDraft }:
+  { items: AnalystClarification[]; onAsk: (q: string) => void; onDraft?: (text: string) => void }) {
+  const [picked, setPicked] = useState<Record<number, string>>({});
+  const reply = (answers: Record<number, string>) => items
+    .map((c, i) => (answers[i] ? `For "${c.question}": ${answers[i]}` : ""))
+    .filter(Boolean).join("\n");
+  const choose = (i: number, option: string) => {
+    const next = { ...picked, [i]: option };
+    if (items.every((_, k) => next[k])) onAsk(reply(next));
+    else setPicked(next);
+  };
+  const other = (i: number) => {
+    const sofar = reply(picked);
+    onDraft?.(`${sofar ? `${sofar}\n` : ""}For "${items[i].question}": `);
+  };
+  return (
+    <section className="clarify-box" aria-label="Clarification needed">
+      <div className="answer-section-title">Clarification needed</div>
+      <p className="clarify-lead">
+        {items.length > 1 ? "Answer each question; your answers are sent together." : "Pick an option, or say what you mean."}
+      </p>
+      {items.map((c, i) => (
+        <div className="clarify-item" key={`${i}-${c.question}`}>
+          <div className="clarify-question">{items.length > 1 ? `${i + 1}. ` : ""}{c.question}</div>
+          {c.why && <div className="clarify-why">{c.why}</div>}
+          <div className="clarify-options" role="group" aria-label={c.question}>
+            {c.options.map((option, k) => (
+              <button type="button" key={option} aria-pressed={picked[i] === option}
+                      className={picked[i] === option ? "picked" : ""} onClick={() => choose(i, option)}>
+                <span className="option-key">{OPTION_KEYS[k]}</span>{option}
+              </button>
+            ))}
+            <button type="button" className="other" onClick={() => other(i)}>
+              <span className="option-key">…</span>Other — please specify
+            </button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/** How a long request was broken down: goal, individual questions, constraints, expected output. */
+function RequestField({ request }: { request?: AnalystResponse["request"] }) {
+  const parts = request?.parts ?? [];
+  const constraints = request?.constraints ?? [];
+  if (parts.length < 2 && !constraints.length) return null;
+  return (
+    <Field label="Your request">
+      {request?.goal && <div><strong>Goal:</strong> {request.goal}</div>}
+      {parts.length > 1 && <ol className="request-parts">{parts.map((p) => <li key={p}>{p}</li>)}</ol>}
+      {constraints.length > 0 && <div><strong>Constraints:</strong> {constraints.join("; ")}</div>}
+      {request?.expected_output && <div><strong>Expected output:</strong> {request.expected_output}</div>}
+    </Field>
+  );
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {

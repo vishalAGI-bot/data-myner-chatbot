@@ -34,8 +34,10 @@ from typing import Literal
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 import llm
@@ -61,8 +63,11 @@ class Turn(BaseModel):
         return ("" if v is None else str(v))[:6000]
 
 
+MAX_MESSAGE_CHARS = 12_000          # a long brief with a dozen questions fits; history turns are clipped separately
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     history: list[Turn] = Field(default_factory=list)
     state: dict = Field(default_factory=dict)          # returned by the previous answer (follow-ups)
     depth: Literal["auto", "fast", "deep"] = "auto"
@@ -94,6 +99,9 @@ class ChatResponse(BaseModel):
     latency_ms: int = 0
     state: dict = Field(default_factory=dict)
     suggested_questions: list[str] = Field(default_factory=list)
+    clarifications: list[dict] = Field(default_factory=list)   # must be answered: question, why, options
+    follow_ups: list[str] = Field(default_factory=list)       # optional next questions
+    request: dict = Field(default_factory=dict)               # goal, parts, constraints, expected output
     request_id: str = ""
 
 
@@ -108,6 +116,26 @@ _LOCAL_ORIGIN = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 app.add_middleware(CORSMiddleware, allow_origins=_origins or ["http://localhost:5173", "http://localhost:4173"],
                    allow_origin_regex=None if _origins else _LOCAL_ORIGIN.pattern,
                    allow_credentials=True, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["*"])
+
+@app.exception_handler(RequestValidationError)
+async def readable_chat_errors(request: Request, exc: RequestValidationError):
+    """A chat request the API cannot take gets a sentence the UI can show, not a list of schema errors."""
+    if not request.url.path.startswith("/api/chat"):
+        return await request_validation_exception_handler(request, exc)
+    problems = []
+    for error in exc.errors():
+        field = str((error.get("loc") or ["", ""])[-1])
+        if field == "message" and error.get("type") == "string_too_long":
+            problems.append(f"Your message is too long ({MAX_MESSAGE_CHARS:,} characters at most). Split it into "
+                            "two messages; the second can refer to the first.")
+        elif field == "message":
+            problems.append("Please type a question.")
+        elif field == "max_seconds":
+            problems.append(f"The thinking time must be between 3 seconds and {MAX_THINK_SECONDS // 60} minutes.")
+        else:
+            problems.append(f"Invalid {field or 'request'}: {error.get('msg', 'not accepted')}.")
+    return JSONResponse(status_code=422, content={"detail": " ".join(dict.fromkeys(problems))})
+
 
 @app.middleware("http")
 async def no_store(request: Request, call_next):

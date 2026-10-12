@@ -94,9 +94,13 @@ def test_deep_falls_back_to_vetted_metric_when_no_custom_query_is_approved():
     agent = make_agent()
     plan = {"action": "custom_sql", "tables": ["session_master"], "reason": "custom count",
             "interpretation": "Visits are sessions in session_master across all apps and all data."}
-    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=_deep_model(plan)):
+    reading = {"rephrased_question": "How many visits are there in total across all apps and all data?",
+               "intent": "analysis", "metric": "visits_overview"}
+    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=_deep_model(plan)), \
+            patch("llm.call_tool", return_value=reading):
         result = agent.ask("how many total user visit?", depth="deep", max_seconds=120)
     assert result.metric == "visits_overview" and result.verified, result.answer
+    assert result.resolved == reading["rephrased_question"], "'Understood as' shows OpenAI's rephrasing"
     assert "Interpreted as: Visits are sessions" in result.answer
     assert any("closest vetted analysis" in step["text"] for step in result.thinking)
 
@@ -149,3 +153,57 @@ def test_rejected_summary_is_dropped_and_table_reverified():
         result = agent.ask("day wise visits", depth="deep", max_seconds=120)
     assert result.verified and result.answer.startswith("Result:"), result.answer
     assert "peaked" not in result.answer and "2026-09-07: visits 2,826" in result.answer
+
+
+DAY_SQL = "SELECT CAST(created_at AS date) AS day, COUNT(*) AS visits FROM session_master GROUP BY 1 ORDER BY 1"
+TWO_ASKS = "how many total user visit? how many visits per day?"
+
+
+def test_auto_mode_without_openai_answers_each_part():
+    """Auto picked Deep for a two-part question, and without OpenAI that used to end in
+    "Deep analysis requires the OpenAI provider" for a user who never asked for Deep."""
+    def local_model(system="", user="", **_):
+        if system.startswith("You route a business question"):
+            return json.dumps({"action": "sql", "tables": ["session_master"]})
+        if system.startswith("You write ONE PostgreSQL"):
+            return json.dumps({"sql": DAY_SQL})
+        return "Visits are counted from sessions."
+
+    with patch("config.LLM_PROVIDER", "ollama"), patch("llm.complete", side_effect=local_model):
+        result = make_agent().ask(TWO_ASKS, depth="auto")
+    assert "requires the OpenAI provider" not in result.answer
+    assert result.route == "deep" and result.verified, result.answer
+    assert [p["question"] for p in result.parts] == ["how many total user visit?", "how many visits per day?"]
+    # The per-day part went through the Fast path's shape check: the whole-period metric cannot
+    # answer it, so it got its own day-wise query instead of a single total.
+    assert "visits: 1,200" in result.parts[0]["answer"]
+    assert "2,826" in result.parts[1]["answer"] and "AS day" in result.parts[1]["sql"]
+
+
+def test_explicit_deep_without_openai_says_what_it_needs():
+    with patch("config.LLM_PROVIDER", "ollama"):
+        result = make_agent().ask(TWO_ASKS, depth="deep")
+    assert result.route == "error" and "requires the OpenAI provider" in result.answer
+
+
+def test_decomposed_deep_answer_shows_the_interpretation_once():
+    plan = {"action": "decompose", "parts": TWO_ASKS.replace("? ", "?|").split("|"), "reason": "two asks",
+            "interpretation": "Visits are sessions in session_master, in total and per visit day."}
+
+    def complete(system="", user="", **_):
+        if system.startswith("You are the lead analyst"):
+            return json.dumps(plan)
+        if system.startswith("You route a business question"):
+            per_day = "per day" in user
+            return json.dumps({"action": "sql", "tables": ["session_master"]} if per_day
+                              else {"action": "metric", "metric": "visits_overview"})
+        if system.startswith("You write ONE PostgreSQL"):
+            return json.dumps({"sql": DAY_SQL})
+        if system.startswith("Verify an analytics answer"):
+            return json.dumps({"valid": True, "issues": []})
+        raise AssertionError(f"unexpected model call: {system[:60]}")
+
+    with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=complete):
+        result = make_agent().ask(TWO_ASKS, depth="deep", max_seconds=120)
+    assert result.route == "deep" and result.verified and len(result.parts) == 2, result.answer
+    assert result.answer.count("Interpreted as: Visits are sessions") == 1, result.answer

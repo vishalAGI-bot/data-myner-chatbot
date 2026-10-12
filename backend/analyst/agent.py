@@ -8,8 +8,10 @@ Pipeline
      checked by the guard, run read-only, and repaired up to twice on errors.
   4. The answer is rendered from the result rows; any model-written narrative
      must only use numbers present in the results (grounding check).
-  5. Deep mode splits complex questions into parts, answers each, checks
-     coverage, and writes a grounded summary - all inside a 60 s budget.
+  5. Deep mode (OpenAI) plans the question - one vetted metric, one custom
+     query, or up to 4 independent parts - answers and verifies each part, and
+     lists the parts' answers as they are - all inside the thinking budget.
+     Without OpenAI, Auto mode answers the rule-split parts one by one instead.
 """
 
 from __future__ import annotations
@@ -17,12 +19,13 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeout, wait
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Callable
 
 import config
@@ -30,19 +33,23 @@ import llm
 from output_format import OUT_OF_SCOPE_MESSAGE, is_explicitly_out_of_scope
 from journey_agent import answer as grounding
 from journey_agent.context import split_style
-from journey_agent.thinking import (DECOMPOSE_SCHEMA, DEFAULT_THINK_SECONDS, Budget, ThinkingStep,
-                                    ThinkingTimeout, looks_complex, parse_json, requested_period_exceeds,
+from journey_agent.thinking import (DEFAULT_THINK_SECONDS, Budget, ThinkingStep, ThinkingTimeout,
+                                    looks_complex, parse_json, requested_period_exceeds,
                                     split_parts_without_llm)
 
-from . import guard, metrics as metric_lib
+from . import guard, metrics as metric_lib, parts as parts_lib, report as report_lib, understanding as understanding_lib
 from .conversation import RESOLVE_SCHEMA, RESOLVE_SYSTEM, Memory, needs_context
-from .catalog import Catalog, MetricDoc
+from .catalog import HOME_OVERRIDE, Catalog, MetricDoc
 from .router import Route, Router
 from .settings import Settings
 from .sources import Result, Source, SourceError
 
 log = logging.getLogger("analyst.agent")
-_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="analyst-llm")
+_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="analyst-llm")
+# Independent parts of one question (Deep parts, a brief's breakdowns) run side by side here, shared by all
+# requests; one request runs at most PART_CONCURRENCY at a time, so a long message cannot starve the others.
+_PARTS = ThreadPoolExecutor(max_workers=16, thread_name_prefix="analyst-part")
+PART_CONCURRENCY = max(1, int(os.getenv("ANALYST_PART_CONCURRENCY", "4")))
 
 
 @dataclass
@@ -66,6 +73,11 @@ class AnalystAnswer:
     state: dict = field(default_factory=dict)       # sent back by the client for follow-ups
     suggested_questions: list[str] = field(default_factory=list)
     reason: str = ""                    # why a question could not be answered (shown to the user)
+    # Questions the user must answer before (part of) the request can be answered:
+    # {"part": n (0 = whole request), "question", "why", "options": [2-4 choices]}.
+    clarifications: list[dict] = field(default_factory=list)
+    follow_ups: list[str] = field(default_factory=list)   # optional next questions, specific to this answer
+    request: dict = field(default_factory=dict)           # goal, parts, constraints, expected output
 
 
 class _ReviewRejected(RuntimeError):
@@ -78,12 +90,25 @@ class _ReviewRejected(RuntimeError):
     """
 
 
+class _PlanError(ValueError):
+    """OpenAI's Deep-analysis strategy could not be used (no valid action, unknown metric, no tables)."""
+
+
+class _UnderstandError(RuntimeError):
+    """OpenAI's question-understanding call failed. There is no rule-based fallback by design."""
+
+
 @dataclass
 class _Run:
     budget: Budget
     trace: list[ThinkingStep] = field(default_factory=list)
     on_event: Callable[[dict], None] | None = None
     memory: "Memory | None" = None
+    home: str | None = None             # who "we" is when the asker said so (this turn or earlier in the chat)
+    home_reason: str = ""
+    home_stated: bool = False           # said in this very message (not carried over from earlier turns)
+    understanding: "understanding_lib.Understanding | None" = None     # OpenAI's reading of this message
+    home_token: object = None
 
 
 _RUN: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("analyst_run", default=None)
@@ -204,25 +229,10 @@ markdown tables, or list every row. For a day-wise / week-wise breakdown, descri
 two sentences; name a highest or lowest value for ONE measure only after checking every row, and never claim
 that several apps or measures share a peak. Always finish your last sentence."""
 
-DECOMPOSE_SYSTEM = """Split a business question about shopping-app data into at most 4 simple, self-contained
-data questions that together answer it (repeat the app, period and filter in every part; keep the user's
-wording such as "only", "last 24 hours"). A single simple question stays as ONE part.
-Every part must be executable independently: never refer to "those users", "the results above", or an
-entity that another part must discover first. When a ranking asks for several columns about the same rows
-(for example top users plus their journey count, apps and purchase rate), keep it as ONE custom-query part.
-Likewise, keep a comparison of several apps across several metrics as ONE custom-query part.
-Vetted analyses:
-{metrics}
-Tables (a part may also be answered with a custom query on these):
-{tables}
-The data covers {first_day} to {last_day} only and has no city tier. "we/us/our" = {home_app}.
-Only put a part in cannot_answer when NO table above holds that information (say what is missing).
-Reply with JSON: {{"parts": [...], "cannot_answer": [{{"part": "...", "missing": "..."}}]}}"""
-
 DEEP_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["metric", "custom_sql", "decompose", "unsupported"]},
+        "action": {"type": "string", "enum": ["metric", "custom_sql", "decompose", "report", "unsupported"]},
         "metric": {"type": "string"},
         "params": {"type": "object"},
         "tables": {"type": "array", "items": {"type": "string"}},
@@ -236,7 +246,10 @@ DEEP_PLAN_SCHEMA = {
 
 DEEP_PLAN_SYSTEM = """You are the lead analyst deciding the complete execution strategy for one Deep analysis.
 Use a vetted metric only when it answers EVERY requested measure, entity, filter and date. Choose custom_sql
-for a cohesive ranking/comparison needing several columns or joins. Choose decompose only for independent
+for a cohesive ranking/comparison needing several columns or joins. Choose report for an executive-summary brief:
+how an app performed across several splits (categories, city, gender, age group, loyalty tier ...) and what went
+well, what went badly or where competitors did better. A report needs no other field; its scope is set separately.
+Choose decompose only for independent
 questions; every part must be executable alone and must repeat its own entities, dates and filters. Never use
 phrases such as "those users" or depend on another part's result. Choose unsupported only when required fields
 do not exist and the requested measure cannot be derived from the documented fields. Treat timestamps,
@@ -349,11 +362,19 @@ code from the complete rows: treat them as correct and judge whether the "Answer
 rows. Report an issue only when the answer states a wrong number or claim, or misses what was asked; a claim you
 re-check and find correct is not an issue. Do not rewrite the answer. Reply only with the required JSON review."""
 
-SYNTH_SYSTEM = """Write the final answer to a business question using ONLY the verified data answers below.
-Every number must appear in them exactly; do not calculate new numbers. Answer each part directly, then give
-supporting numbers. Say which parts cannot be answered and why. At most 200 words. "we/us/our" = {home_app}.
-Each "Complete result" is the whole query output: never say the data is partial, cut off or missing rows
-unless it says "more rows exist". Name every item when the question asks for a list."""
+FOLLOW_UP_SCHEMA = {
+    "type": "object",
+    "properties": {"questions": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 3}},
+    "required": ["questions"],
+}
+
+FOLLOW_UP_SYSTEM = """Suggest 2 or 3 follow-up questions the user could ask next about shopping-app data.
+Make them specific to the question and the answer below - a natural next step such as a breakdown, a comparison
+with a named competitor, a longer period, or the reason behind a gap the answer shows - not generic ideas, and
+never a repeat of what was already answered. Each must be answerable from this data: apps {apps}; data from
+{first_day} to {last_day}; analyses such as {analyses}. Do not state or imply any figure the answer does not
+contain, and do not invent apps or categories. One short question each, at most 20 words.
+Reply with JSON: {{"questions": ["...", "..."]}}"""
 
 COMPARE_SYSTEM = """Answer a comparison question about shopping-app data for a business reader in 2 to 4 sentences.
 Start with a direct verdict that answers the question as asked (for example "Not a spike:", "Yes:", "Meesho is
@@ -365,7 +386,8 @@ use markdown headings or tables. "we / us / our" means {home_app}. Always finish
 SIMPLE_SYSTEM = """Explain what the data answer below MEANS for a non-technical shop owner, in one to three
 short sentences (a journey is one product hunt, apps are shopping apps, leakage means buying on another app).
 Do NOT write any number, digit, percentage, date or id, not even as words; the exact figures are shown below
-your text. No exclamation marks."""
+your text. Never say the data lacks a field unless the text says that field is not recorded: "too few people to
+compare" means small groups, not missing information. No exclamation marks."""
 
 # The reviewer keeps reading the answer's row limit as missing data, even when the complete table is
 # rendered beside it. When the result is genuinely whole, such an objection is false by construction.
@@ -737,8 +759,12 @@ class AnalystAgent:
         token = _RUN.set(run)
         memory: Memory | None = None
         question = message
+        home_token = None
         try:
             question, style = split_style(message)
+            understood = self.use_llm and config.LLM_PROVIDER == "openai"
+            if not understood:
+                home_token = self._adopt_home(question, state or {}, run)
             history = [{**h, "content": split_style(str(h.get("content")))[0] if h.get("role") == "user"
                         else h.get("content")} for h in (history or []) if h.get("content")][-12:]
             if not question.strip():
@@ -747,11 +773,15 @@ class AnalystAgent:
                 memory = Memory.from_state(state)
                 run.memory = memory
                 asked = question.strip()
-                question, continues = self._contextualize(asked, history, memory)
-                result = self._ask(question, history, state or {}, depth,
-                                   memory if continues else None, original=asked)
-                if question != asked:
-                    result.notes.insert(0, f"Read as: {question}")
+                if understood:
+                    result = self._ask_understood(asked, history, state or {}, depth)
+                    question = run.understanding.question if run.understanding else asked
+                else:
+                    question, continues = self._contextualize(asked, history, memory)
+                    result = self._ask(question, history, state or {}, depth,
+                                       memory if continues else None, original=asked)
+                    if question != asked:
+                        result.notes.insert(0, f"Read as: {question}")
                 if result.route == "out_of_scope":
                     result.answer = OUT_OF_SCOPE_MESSAGE
                     result.verified = False
@@ -773,12 +803,23 @@ class AnalystAgent:
                     result.suggested_questions = result.suggested_questions or self._available_questions()
                 if style == "simple" and result.route in ("metric", "sql", "deep"):
                     result = self._simplify(result)
-        except (ValueError, json.JSONDecodeError) as exc:
-            self._emit("verify", f"OpenAI returned an invalid Deep-analysis plan: {exc}", ok=False)
+        except _UnderstandError as exc:
+            self._emit("understand", f"OpenAI could not read the question: {exc}", ok=False)
             result = AnalystAnswer(
-                "OpenAI could not produce a valid Deep-analysis plan for this question. Try rephrasing "
-                "the requested metrics, entities, and date range.", route="error", source="llm",
-                resolved=question, depth="deep", verified=False)
+                f"I could not understand this question with OpenAI ({exc}). Please try again in a moment.",
+                route="error", source="llm", resolved=question, verified=False)
+        except _PlanError as exc:
+            self._emit("verify", f"OpenAI's Deep-analysis plan could not be used: {exc}", ok=False)
+            result = AnalystAnswer(
+                f"OpenAI could not produce a usable Deep-analysis plan for this question ({exc}). Try asking the "
+                "parts one at a time, or name the metrics, apps and dates you need.", route="error",
+                source="llm", resolved=question, depth="deep", verified=False)
+        except (ValueError, json.JSONDecodeError) as exc:
+            log.exception("unreadable model reply")
+            self._emit("verify", f"A model reply could not be read: {exc}", ok=False)
+            result = AnalystAnswer(
+                "The language model returned a reply that could not be read, so this question was not "
+                "answered. Please try again.", route="error", source="llm", resolved=question, verified=False)
         except ThinkingTimeout as exc:
             self._emit("stop", f"Stopped: {exc}", ok=False)
             result = AnalystAnswer(f"I stopped because {exc} before I had a verified answer.",
@@ -788,10 +829,19 @@ class AnalystAgent:
                                    f"({exc}). Try one of the built-in analyses (see Try asking).",
                                    route="error")
         finally:
+            for t in (home_token, run.home_token):
+                if t is not None:
+                    HOME_OVERRIDE.reset(t)
             _RUN.reset(token)
         if memory is not None:
             memory.remember(question, result)
             result.state = {**(result.state or {}), **memory.to_state()}
+        if run.home and run.understanding is None:
+            result.state = {**(result.state or {}), "home_app": run.home}
+        if run.understanding is not None and result.route not in ("out_of_scope", "error"):
+            result.resolved = run.understanding.question         # shown as "Understood as"
+            if not result.follow_ups and not result.clarifications and not result.timed_out:
+                result.follow_ups = self._follow_ups(run, result)
         result.thinking = [s.as_dict() for s in run.trace]
         result.latency_ms = int((time.perf_counter() - started) * 1000)
         log.info("route=%s metric=%s tables=%s latency_ms=%s", result.route, result.metric,
@@ -812,6 +862,8 @@ class AnalystAgent:
                 f"{self.cat.date_range[0]} to {self.cat.date_range[1]}.",
                 route="data_gap", resolved=question,
                 verified=False, suggested_questions=self._available_questions())
+        if depth != "fast" and self._report_ready() and report_lib.looks_like_report(question):
+            return self._report(question, history)
         route, ex = self.router.route(question, state)
         route = self._continue_previous(route, continuation, question)
         grain = requested_time_grain(question)
@@ -828,7 +880,7 @@ class AnalystAgent:
             route = Route("sql", route.metric, route.params, route.tables, 0.0,
                           f"{wanted} breakdown needs its own query", focus=route.focus, notes=route.notes)
         confident = route.kind == "metric" and route.confidence >= 0.6
-        rule_parts = self._split_by_rules(question, route)
+        rule_parts = self._rule_parts(question, route)
         result: AnalystAnswer | None = None
         deep = depth == "deep" or (depth == "auto" and (
             looks_complex(question, confident) or len(rule_parts) > 1
@@ -843,6 +895,12 @@ class AnalystAgent:
                 self._emit("verify", "Result came from a vetted read-only query")
             result.notes.extend(n for n in route.notes if n not in result.notes)
             deep = False
+        if deep and depth != "deep" and config.LLM_PROVIDER != "openai":
+            # Auto chose Deep, but Deep planning needs OpenAI. The user did not ask for Deep, so answer
+            # with what the local setup can do instead of telling them to switch providers.
+            deep = False
+            if len(rule_parts) > 1:
+                result = self._local_parts(rule_parts, history)
         if deep:
             result = self._deep(question, history, original)
             result.notes.extend(n for n in route.notes if n not in result.notes)
@@ -850,6 +908,9 @@ class AnalystAgent:
             result = self._answer_one(question, history, state, route, original=original)
         if not deep:
             self._compare(question, result)
+        return self._with_notes(question, result, grain)
+
+    def _with_notes(self, question: str, result: AnalystAnswer, grain: str | None) -> AnalystAnswer:
         if (_PERIOD_WORDS.search(question) and grain is None and self.cat.date_range[0]
                 and result.route != "data_gap"):
             result.notes.append(f"The database covers {self.cat.date_range[0]} to {self.cat.date_range[1]} only, "
@@ -858,8 +919,200 @@ class AnalystAgent:
             result.notes.append(f"‘Current’ means the latest available company data, through "
                                 f"{self.cat.date_range[1]}; it does not mean the calendar date.")
         if result.notes and result.route not in ("clarify", "help"):
-            result.answer += "\n\nNote: " + " ".join(dict.fromkeys(result.notes))
+            result.answer += "\n\nNote: " + " ".join(dict.fromkeys(_sentence(n) for n in result.notes))
         return result
+
+    def _follow_ups(self, run: _Run, result: AnalystAnswer) -> list[str]:
+        """2-3 optional next questions, specific to this question and its answer, answerable from this data.
+        A suggestion that carries a number the answer does not contain is dropped: it would imply a fact."""
+        answered = result.route in ("metric", "proxy", "sql", "deep") and (
+            (result.table and result.table.get("rows")) or any(p.get("table") for p in result.parts))
+        if not answered or not self.use_llm or run.budget.no_llm or run.budget.remaining() < 6:
+            return []
+        token = _RUN.set(run)
+        try:
+            raw = self._llm(
+                system=FOLLOW_UP_SYSTEM.format(first_day=self.cat.date_range[0], last_day=self.cat.date_range[1],
+                                               apps=", ".join(self.cat.apps),
+                                               analyses="; ".join(m.title for m in self.cat.metrics.values()
+                                                                  if m.available)),
+                user=f"Question: {result.resolved}\n\nAnswer:\n{result.answer[:4000]}",
+                model=config.ANSWER_MODEL, max_tokens=400, schema=FOLLOW_UP_SCHEMA, cap=15, reserve=1)
+            questions = parse_json(raw).get("questions") or []
+        except Exception:                      # noqa: BLE001 - optional suggestions never cost the user the answer
+            log.info("no follow-up questions", exc_info=True)
+            return []
+        finally:
+            _RUN.reset(token)
+        evidence = [result.answer, result.resolved, "1 7 14 24 30 48 72"]
+        out = []
+        for q in questions[:4]:
+            q = str(q).strip()
+            if (q and len(q) <= 200 and q.lower() != result.resolved.lower()
+                    and not grounding.ungrounded_numbers(q, evidence)):
+                out.append(q if q.endswith("?") else q + "?")
+        if out:
+            self._emit("write", f"Suggested {len(out[:3])} follow-up questions")
+        return out[:3]
+
+    # ====================================================== OpenAI understanding
+    def _understand(self, message: str, history: list[dict]) -> understanding_lib.Understanding:
+        """One forced call of OpenAI's understand_question tool, with the conversation and live data facts."""
+        run = _RUN.get()
+        first, last = self.cat.date_range
+        try:
+            yesterday = (date.fromisoformat(str(last)[:10]) - timedelta(days=1)).isoformat() if last else ""
+        except ValueError:
+            yesterday = ""
+        system = understanding_lib.SYSTEM.format(
+            home_app=self.cat.home_app, first_day=first, last_day=last, yesterday=yesterday,
+            week_start=self._week_start() if last else "", breakdowns=", ".join(report_lib.BREAKDOWNS),
+            max_parts=understanding_lib.MAX_PARTS,
+            apps=", ".join(self.cat.apps) or "(none)",
+            sub_apps=", ".join(f"{a} (in {p})" for a, p in sorted(self.cat.app_parents.items())) or "none",
+            metrics=self.cat.metric_menu(), tables=self.cat.table_menu(),
+            categories=report_lib.category_menu(self.cat.category_tree), glossary=self.cat.glossary[:4000])
+        conversation = (run.memory.prompt() if run is not None and run.memory else "") + self._recent_text(history)
+        self._emit("understand", "OpenAI is reading the question (understand_question tool)")
+        try:
+            args = self._llm(call=llm.call_tool, system=system,
+                             user=conversation + f"Latest message: {message}",
+                             name=understanding_lib.TOOL_NAME, description=understanding_lib.TOOL_DESCRIPTION,
+                             parameters=understanding_lib.PARAMETERS, max_tokens=2000, cap=30, reserve=8)
+        except llm.LLMError as exc:
+            raise _UnderstandError(str(exc)) from exc
+        u = understanding_lib.parse(args, apps=self.cat.apps, metrics=self.cat.metrics,
+                                    tables=self.cat.allowed_tables, date_range=self.cat.date_range,
+                                    fallback_question=message)
+        self._emit("understand", f"OpenAI rephrased the question: {u.question}")
+        self._emit("understand", f"OpenAI's reading: {u.summary()}")
+        if u.dropped:
+            self._emit("understand", "Not in the live data, ignored: " + ", ".join(u.dropped), ok=False)
+        return u
+
+    def _ask_understood(self, message: str, history: list[dict], state: dict, depth: str) -> AnalystAnswer:
+        """Route by OpenAI's reading of the question. No keyword list or regular expression interprets it."""
+        run = _RUN.get()
+        u = run.understanding = self._understand(message, history)
+        if u.focus_app and u.focus_app != self.cat.home_app:
+            run.home_token = HOME_OVERRIDE.set(u.focus_app)
+        question = u.question
+        if u.intent == "out_of_scope" or is_explicitly_out_of_scope(message):     # the safety policy still applies
+            return AnalystAnswer(OUT_OF_SCOPE_MESSAGE, route="out_of_scope", source="llm", resolved=question,
+                                 verified=False, suggested_questions=self._available_questions())
+        if u.blocked:
+            self._emit("plan", f"The answer depends on {len(u.clarifications)} detail"
+                               f"{'s' if len(u.clarifications) != 1 else ''} only the user can give; asking first")
+            many = len(u.clarifications) > 1
+            return AnalystAnswer(
+                f"Before I run this, I need {'a few details' if many else 'one detail'} from you, because the "
+                f"answer depends on {'them' if many else 'it'}. Pick an option below, or say what you mean.",
+                route="clarify", source="llm", resolved=question, verified=False,
+                clarifications=u.clarifications, request=u.request())
+        if u.several:
+            result = self._answer_parts(u, history, message)
+            result.request = u.request()
+            return result
+        if u.intent == "unsupported":
+            return AnalystAnswer("", route="unsupported", source="llm", resolved=question, reason=u.message)
+        if u.outside_coverage:
+            self._emit("plan", "The requested period extends beyond the available data", ok=False)
+            return AnalystAnswer(
+                "The requested period is not fully available. The available data covers "
+                f"{self.cat.date_range[0]} to {self.cat.date_range[1]}.", route="data_gap", source="llm",
+                resolved=question, verified=False, suggested_questions=self._available_questions())
+        pending = u.clarifications                         # only some parts are unclear: answer the rest
+        clear = u.clear_parts
+        if pending:
+            self._emit("plan", f"Answering the {len(clear)} clear part{'s' if len(clear) != 1 else ''} now; "
+                               f"asking about the other {len(u.parts) - len(clear)}")
+        if u.intent == "brief" and depth != "fast" and self._report_ready():
+            result = self._report(question, history, u)
+        elif pending and len(clear) == 1:
+            result = self._answer_one(clear[0], history, state,
+                                      Route("sql", tables=[], confidence=0.0, source="llm"), original=message)
+            self._compare(clear[0], result)
+        elif len(clear) > 1 and (pending or u.intent in ("multi_part", "analysis")):
+            result = self._deep(question, history, original=message, given_parts=clear)
+        elif u.intent in ("multi_part", "brief") or depth == "deep":
+            result = self._deep(question, history, original=message)
+        else:
+            result = self._answer_understood(u, history, state, message)
+            self._compare(question, result)
+        result.clarifications = pending + [c for c in result.clarifications if c not in pending]
+        result.request = u.request()
+        if result.clarifications and result.route != "clarify":
+            open_parts = [c for c in result.clarifications if c["part"]]
+            result.answer += ("\n\n**Still open:** "
+                              + (f"{len(open_parts)} part{'s' if len(open_parts) != 1 else ''} of your request "
+                                 "need" + ("s" if len(open_parts) == 1 else "") + " a detail from you"
+                                 if open_parts else "a detail from you would sharpen this answer")
+                              + " (see \u201cClarification needed\u201d).")
+        return self._with_notes(question, result, u.time_grain)
+
+    def _understood_route(self, u: understanding_lib.Understanding) -> Route | None:
+        """OpenAI's vetted analysis for the whole question as a route (see _reading_route)."""
+        raw = dict(u.metric_params)
+        metric = self.cat.metrics.get(u.metric or "")
+        for key, value in (("date_from", u.date_from), ("date_to", u.date_to), ("window_hours", u.window_hours)):
+            if metric is not None and value and metric.param(key) and key not in raw:
+                raw[key] = value
+        return self._reading_route(u.question, u.metric, raw, u, u.apps)
+
+    def _reading_route(self, question: str, metric_name: str | None, raw: dict, shape, apps: list[str]) -> Route | None:
+        """A vetted analysis OpenAI chose, as a route - when it exists, is ready and returns the shape asked for
+        (``shape`` is the whole question's reading or one part's)."""
+        metric = self.cat.metrics.get(metric_name or "")
+        if metric is None or not metric.available or metric.name in self.cat.metric_issues:
+            return None
+        if self._shape_mismatch(shape, metric):
+            self._emit("plan", f"'{metric.title}' does not return the shape asked for; writing a custom query",
+                       ok=False)
+            return None
+        params, focus, per_app = self._model_metric_params(metric, dict(raw), question,
+                                                           focus=apps if metric.focus_parameter == "app" else [])
+        if per_app:
+            return None                                           # several apps on a one-app analysis
+        return Route("metric", metric, params, metric.tables, 1.0, "OpenAI understanding", focus=focus, source="llm")
+
+    def _wrong_shape(self, question: str, metric: MetricDoc, original: str = "") -> bool:
+        """Whether a vetted metric cannot return the shape asked for. For the question OpenAI read, its reading
+        decides; for anything else (a Deep sub-part, the Ollama path) the wording does."""
+        run = _RUN.get()
+        u = run.understanding if run is not None else None
+        if u is not None and question == u.question:
+            return self._shape_mismatch(u, metric)
+        return _grain_mismatch(question, metric, original)
+
+    @staticmethod
+    def _shape_mismatch(u, metric: MetricDoc) -> bool:
+        """The question's shape comes from OpenAI's reading (of the question or of one part); the analysis's
+        shape from its own SQL."""
+        return bool((u.time_grain and _metric_grain(metric) != u.time_grain)
+                    or (u.per_app and not _metric_by_app(metric))
+                    or (u.per_user and not _metric_groups_by(metric, r"\buser"))
+                    or getattr(u, "adds_columns", False))
+
+    def _answer_understood(self, u: understanding_lib.Understanding, history: list[dict], state: dict,
+                           message: str) -> AnalystAnswer:
+        route = self._understood_route(u)
+        if route is not None:
+            self._emit("plan", f"OpenAI chose the vetted analysis: {route.metric.title}")
+            return self._answer_one(u.question, history, state, route, original=message)
+        prev = self._last_turn()
+        prior = prev.get("sql") if u.follows_previous and prev and prev.get("answered") else ""
+        tables = u.tables or (list(prev.get("tables") or []) if prior else [])
+        if tables and self.s.allow_free_sql:
+            return self._free_sql(u.question, history, tables,
+                                  Route("sql", tables=tables, confidence=1.0, source="llm", prior_sql=prior or ""), [])
+        # No analysis and no tables named: OpenAI chooses one with the plan prompt.
+        return self._answer_one(u.question, history, state, Route("sql", tables=[], confidence=0.0, source="llm"),
+                                original=message)
+
+    @staticmethod
+    def _last_turn() -> dict | None:
+        run = _RUN.get()
+        return run.memory.last if run is not None and run.memory else None
 
     def _continue_previous(self, route: Route, continuation: Memory | None, question: str) -> Route:
         """Keep a follow-up on the analysis it is following up on.
@@ -911,7 +1164,7 @@ class AnalystAgent:
             if plan:
                 action = plan.get("action")
                 if (action == "metric" and plan.get("metric") in self.cat.metrics and self.s.allow_free_sql
-                        and _grain_mismatch(question, self.cat.metrics[plan["metric"]], original)):
+                        and self._wrong_shape(question, self.cat.metrics[plan["metric"]], original)):
                     self._emit("plan", "The chosen analysis lacks the requested period breakdown; "
                                        "writing a custom query instead")
                     action = "sql"
@@ -1018,7 +1271,7 @@ class AnalystAgent:
     # (in Deep mode) verify the answer instead of timing out with rows in hand.
     QUERY_RESERVE_S = 5
 
-    def _execute(self, sql: str) -> Result:
+    def _execute(self, sql: str, reserve: float | None = None) -> Result:
         run = _RUN.get()
         timeout_ms = None
         if run is not None:
@@ -1026,7 +1279,8 @@ class AnalystAgent:
                 timeout_ms = 3000                     # post-deadline rule answers: short, fixed limit
             else:
                 run.budget.check(0)
-                reserve = min(self.QUERY_RESERVE_S, run.budget.seconds * 0.1)
+                if reserve is None:
+                    reserve = min(self.QUERY_RESERVE_S, run.budget.seconds * 0.1)
                 timeout_ms = int(max(1000, (run.budget.remaining() - reserve) * 1000))
         return self.source.query(sql, max_rows=self.s.max_rows, timeout_ms=timeout_ms)
 
@@ -1047,7 +1301,7 @@ class AnalystAgent:
         elif route.metric is not None:
             example = f"\nA vetted query on similar data (adapt, do not copy blindly):\n{route.metric.sql[:1500]}\n"
         system = SQL_SYSTEM.format(schema=self.cat.schema_card(tables), window=self.s.default_window_hours,
-                                   home_app=self.s.home_app, max_rows=self.s.max_rows,
+                                   home_app=self.cat.home_app, max_rows=self.s.max_rows,
                                    glossary=self.cat.glossary[:4000],
                                    time_rules=TIME_GRAIN_RULES.format(max_rows=self.s.max_rows))
         if strict_deep:
@@ -1062,50 +1316,58 @@ class AnalystAgent:
         reviewed_out: tuple | None = None       # last query the guard passed but the reviewer did not
         flagged: list[str] = []                 # every issue so far, so a repair never reintroduces one
         attempts = 4 if strict_deep else 3
-        for attempt in range(attempts):
-            raw = self._llm(system=system, user=prompt + feedback, model=config.SQL_MODEL,
-                            max_tokens=2200 if strict_deep else 1000,
-                            schema=SQL_SCHEMA, cap=25)
-            sql = _extract_sql(raw)
-            try:
-                checked = guard.check(sql, self.cat, dialect=self.source.dialect, max_rows=self.s.max_rows,
-                                      schema=self.s.db_schema)
-                if strict_deep:
-                    unexpected = [table for table in checked.tables if table not in tables]
-                    if unexpected:
-                        raise guard.GuardError(
-                            "query used tables outside the selected Deep-analysis scope: "
-                            + ", ".join(unexpected))
-                    semantic_error = _custom_sql_semantic_error(question, checked.sql)
-                    if semantic_error:
-                        raise guard.GuardError(semantic_error)
-                    review_issues = self._openai_review_sql(question, checked.sql, tables, interpretation)
-                    if review_issues:
-                        raise _ReviewRejected("OpenAI SQL review: " + "; ".join(review_issues[:4]))
-                    self._emit("verify", "OpenAI approved the query logic before execution")
-                self._emit("query", f"Running the custom query (attempt {attempt + 1})")
-                result = self._execute(checked.sql)
-            except (_ReviewRejected, guard.GuardError, SourceError) as exc:
-                last_error = str(exc)
-                if isinstance(exc, _ReviewRejected):
-                    # Guard-approved and runnable: keep it as a fallback in case nothing is approved.
-                    reviewed_out = (checked, last_error)
-                self._emit("verify", f"Query rejected: {last_error[:500]}", ok=False)
-                flagged.append(last_error)
-                earlier = "".join(f"\n- {issue}" for issue in flagged[:-1])
-                feedback = (f"\n\nYour previous SQL:\n{sql}\nfailed with: {last_error}"
-                            + (f"\nEarlier attempts were also rejected for these reasons; keep all of them fixed:"
-                               f"{earlier}" if earlier else "")
-                            + "\nFix it and reply with JSON.")
-                continue
-            narrative, grounded = (("", True) if not narrate or (self.use_llm and _COMPARISON.search(question))
-                                   else self._narrate(question, result, notes))
-            table_text = render_result(result, title="Result", detail="", focus=[],
-                                       max_lines=50 if strict_deep else 10)
-            text = (narrative + "\n\n" + table_text) if narrative else table_text
-            return AnalystAnswer(text, route="sql", source="llm", resolved="custom query", tables=checked.tables,
-                                 sql=checked.sql, table=result.as_table(), notes=notes, verified=grounded,
-                                 state={"tables": checked.tables, "sql": checked.sql})
+        try:
+            for attempt in range(attempts):
+                raw = self._llm(system=system, user=prompt + feedback, model=config.SQL_MODEL,
+                                max_tokens=3000 if strict_deep else 1200,
+                                schema=SQL_SCHEMA, cap=25)
+                sql = _extract_sql(raw)
+                try:
+                    checked = guard.check(sql, self.cat, dialect=self.source.dialect, max_rows=self.s.max_rows,
+                                          schema=self.s.db_schema)
+                    if strict_deep:
+                        unexpected = [table for table in checked.tables if table not in tables]
+                        if unexpected:
+                            raise guard.GuardError(
+                                "query used tables outside the selected Deep-analysis scope: "
+                                + ", ".join(unexpected))
+                        semantic_error = _custom_sql_semantic_error(question, checked.sql)
+                        if semantic_error:
+                            raise guard.GuardError(semantic_error)
+                        review_issues = self._openai_review_sql(question, checked.sql, tables, interpretation)
+                        if review_issues:
+                            raise _ReviewRejected("OpenAI SQL review: " + "; ".join(review_issues[:4]))
+                        self._emit("verify", "OpenAI approved the query logic before execution")
+                    self._emit("query", f"Running the custom query (attempt {attempt + 1})")
+                    result = self._execute(checked.sql)
+                except (_ReviewRejected, guard.GuardError, SourceError) as exc:
+                    last_error = str(exc)
+                    if isinstance(exc, _ReviewRejected):
+                        # Guard-approved and runnable: keep it as a fallback in case nothing is approved.
+                        reviewed_out = (checked, last_error)
+                    self._emit("verify", f"Query rejected: {last_error[:500]}", ok=False)
+                    flagged.append(last_error)
+                    earlier = "".join(f"\n- {issue}" for issue in flagged[:-1])
+                    feedback = (f"\n\nYour previous SQL:\n{sql}\nfailed with: {last_error}"
+                                + (f"\nEarlier attempts were also rejected for these reasons; keep all of them fixed:"
+                                   f"{earlier}" if earlier else "")
+                                + "\nFix it and reply with JSON.")
+                    continue
+                narrative, grounded = (("", True) if not narrate or (self.use_llm and _COMPARISON.search(question))
+                                       else self._narrate(question, result, notes))
+                table_text = render_result(result, title="Result", detail="", focus=[],
+                                           max_lines=50 if strict_deep else 10)
+                text = (narrative + "\n\n" + table_text) if narrative else table_text
+                return AnalystAnswer(text, route="sql", source="llm", resolved="custom query", tables=checked.tables,
+                                     sql=checked.sql, table=result.as_table(), notes=notes, verified=grounded,
+                                     state={"tables": checked.tables, "sql": checked.sql})
+        except ThinkingTimeout:
+            if reviewed_out is None:
+                raise
+            # Out of time with a query the guard approved but the reviewer questioned: show it, flagged,
+            # rather than nothing. The rows come from a short, fixed-limit run.
+            self._emit("stop", "Out of time; running the last guard-approved query, flagged", ok=False)
+            _RUN.get().budget.no_llm = True
         if reviewed_out is not None:
             # Every attempt was turned down by the reviewer alone. Running the last one and flagging it
             # beats answering nothing: the guard allowed it, the session is read-only, and the user can
@@ -1121,7 +1383,7 @@ class AnalystAgent:
                 if result.rows:
                     detail = why.removeprefix("OpenAI SQL review: ").rstrip(".")
                     narrative = ""
-                    if narrate and self.use_llm:
+                    if narrate and self.use_llm and not _RUN.get().budget.no_llm:
                         narrative = self._narrate(question, result, notes)[0]
                     table_text = render_result(result, title="Result", detail="", focus=[],
                                                max_lines=50 if strict_deep else 10)
@@ -1140,9 +1402,18 @@ class AnalystAgent:
         if not (_COMPARISON.search(question) and result.table and result.table.get("rows")
                 and result.route in ("metric", "proxy", "sql")):
             return
-        ex = self.router.extract(question)
-        focus = list(ex.apps) + [v for v in (ex.category, result.params.get("category")) if v]
-        facts = comparison_facts(result.table, question, focus, (ex.date_from, ex.date_to),
+        run = _RUN.get()
+        u = run.understanding if run is not None else None
+        if u is not None:
+            named = [str(c.get("asked") or "") for c in u.categories] + [str(m) for c in u.categories
+                                                                         for m in c.get("matches") or []]
+            focus = list(dict.fromkeys(u.apps + [v for v in named + [result.params.get("category")] if v]))
+            period = (u.date_from, u.date_to)
+        else:
+            ex = self.router.extract(question)
+            focus = list(ex.apps) + [v for v in (ex.category, result.params.get("category")) if v]
+            period = (ex.date_from, ex.date_to)
+        facts = comparison_facts(result.table, question, focus, period,
                                  baseline=bool(_BASELINE.search(question)),
                                  comparable_from=self.cat.category_comparable_from)
         if facts:
@@ -1162,7 +1433,7 @@ class AnalystAgent:
         settings = ", ".join(f"{k} = {v}" for k, v in result.params.items()) or "none"
         try:
             text = self._llm(
-                system=COMPARE_SYSTEM.format(home_app=self.s.home_app),
+                system=COMPARE_SYSTEM.format(home_app=self.cat.home_app),
                 user=(f"Question: {question}\n\nComputed comparison facts:\n"
                       + ("\n".join(f"- {f}" for f in facts) or "(none)")
                       + f"\n\nAnalysis settings: {settings}\nCaveats: {caveats}"
@@ -1187,7 +1458,7 @@ class AnalystAgent:
             return "", True
         evidence = result.to_text(self.s.max_rows)
         try:
-            text = self._llm(system=NARRATIVE_SYSTEM.format(home_app=self.s.home_app),
+            text = self._llm(system=NARRATIVE_SYSTEM.format(home_app=self.cat.home_app),
                              user=f"Question: {question}\n\nResult:\n{evidence}\n\nCaveats: {' '.join(notes) or 'none'}",
                              model=config.ANSWER_MODEL, max_tokens=300, cap=20).strip()
         except (llm.OllamaError, ThinkingTimeout):
@@ -1205,7 +1476,7 @@ class AnalystAgent:
     def _llm_plan(self, question: str, history: list[dict], route: Route) -> dict | None:
         self._emit("understand", "Asking the model which analysis fits")
         raw = self._llm(
-            system=PLAN_SYSTEM.format(home_app=self.s.home_app, first_day=self.cat.date_range[0],
+            system=PLAN_SYSTEM.format(home_app=self.cat.home_app, first_day=self.cat.date_range[0],
                                       last_day=self.cat.date_range[1], metrics=self.cat.metric_menu(),
                                       tables=self.cat.table_menu(), glossary=self.cat.glossary[:4000],
                                       apps=", ".join(self.cat.apps)),
@@ -1229,8 +1500,15 @@ class AnalystAgent:
                   f"{self.cat.schema_card(tables)}\n\n"
                   f"Active data coverage: {self.cat.date_range[0]} to {self.cat.date_range[1]}.\n\n"
                   f"Proposed SQL:\n{sql}"),
-            model=config.AGENT_MODEL, max_tokens=350, schema=SQL_REVIEW_SCHEMA, cap=15, reserve=5)
-        review = parse_json(raw)
+            model=config.AGENT_MODEL, max_tokens=900, schema=SQL_REVIEW_SCHEMA, cap=15, reserve=5)
+        try:
+            review = parse_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            # An unreadable review is not a verdict. The guard already passed the query, and the answer is
+            # verified against its rows after it runs, so go on rather than lose the whole analysis.
+            self._emit("verify", "OpenAI's SQL review could not be read; relying on the guard and the answer check",
+                       ok=False)
+            return []
         minor = [str(x) for x in review.get("minor_issues") or [] if str(x).strip()]
         if minor:
             self._emit("verify", "OpenAI minor review notes (not blocking): " + "; ".join(minor[:3]))
@@ -1255,8 +1533,11 @@ class AnalystAgent:
                   f"\n\nResult rows ({_table_size(result.table)}):\n"
                   f"{_table_text(result.table, limit=self.s.max_rows)[:60000]}"
                   f"\n\nProposed answer:\n{result.answer[:30000]}"),
-            model=config.ANSWER_MODEL, max_tokens=400, schema=ANSWER_REVIEW_SCHEMA, cap=20, reserve=3)
-        review = parse_json(raw)
+            model=config.ANSWER_MODEL, max_tokens=900, schema=ANSWER_REVIEW_SCHEMA, cap=20, reserve=3)
+        try:
+            review = parse_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            return ["the verification reply could not be read, so this answer is unchecked"]
         if review.get("valid"):
             return []
         issues = [str(x) for x in review.get("issues") or []]
@@ -1269,7 +1550,8 @@ class AnalystAgent:
         return issues
 
     # ========================================================== deep mode
-    def _deep(self, question: str, history: list[dict], original: str = "") -> AnalystAnswer:
+    def _deep(self, question: str, history: list[dict], original: str = "",
+              given_parts: list[str] | None = None) -> AnalystAnswer:
         budget = _RUN.get().budget
         parts: list[str] = []
         routes: dict[str, Route] = {}
@@ -1277,14 +1559,20 @@ class AnalystAgent:
         cannot: list[dict] = []
         results: list[tuple[str, AnalystAnswer]] = []
         timed_out = None
+        interpretation = ""
         if config.LLM_PROVIDER != "openai":
             return AnalystAnswer(
                 "Deep analysis requires the OpenAI provider. Select OpenAI in Connection settings, "
                 "test the connection, and try again.", route="error", source="rules", resolved=question,
                 depth="deep", verified=False)
         try:
-            self._emit("understand", "OpenAI is choosing the complete Deep-analysis strategy")
-            decision = self._deep_plan(question, history)
+            if given_parts:
+                # Every individual question OpenAI found in the request gets its own answer.
+                decision = {"action": "decompose", "parts": given_parts, "interpretation": "",
+                            "reason": f"answer each of the {len(given_parts)} questions in the request"}
+            else:
+                self._emit("understand", "OpenAI is choosing the complete Deep-analysis strategy")
+                decision = self._deep_plan(question, history)
             action = decision.get("action")
             interpretation = str(decision.get("interpretation") or "").strip()
             self._emit("plan", "OpenAI decision: " + str(decision.get("reason") or action))
@@ -1295,18 +1583,21 @@ class AnalystAgent:
             # for "and add user id" and answer with a different table altogether.
             if action == "metric":
                 picked = self.cat.metrics.get(str(decision.get("metric") or ""))
-                if picked is not None and picked.available and _grain_mismatch(question, picked, original):
+                if picked is not None and picked.available and self._wrong_shape(question, picked, original):
                     self._emit("plan", f"'{picked.title}' does not return what was asked for; "
                                        "writing a custom query instead", ok=False)
                     action = "custom_sql"
                     decision = {**decision, "tables": decision.get("tables") or list(picked.tables)}
+            if action == "report":
+                self._emit("plan", "OpenAI read this as an executive-summary brief")
+                return self._report(question, history, _RUN.get().understanding)
             if action == "unsupported":
                 cannot = [{"part": question,
                            "missing": decision.get("message") or decision.get("reason") or "required data"}]
             elif action == "metric":
                 metric = self.cat.metrics.get(str(decision.get("metric") or ""))
                 if metric is None or not metric.available:
-                    raise ValueError("OpenAI selected an unavailable metric")
+                    raise _PlanError("OpenAI selected an unavailable metric")
                 params, focus, per_app = self._model_metric_params(metric, decision.get("params"), question)
                 if per_app:
                     # A single-app analysis asked for several apps: one vetted run per app.
@@ -1324,7 +1615,7 @@ class AnalystAgent:
                 selected = [str(t) for t in decision.get("tables") or []
                             if str(t) in self.cat.allowed_tables]
                 if not selected:
-                    raise ValueError("OpenAI did not select tables for the custom analysis")
+                    raise _PlanError("OpenAI did not select tables for the custom analysis")
                 # Journey events are only meaningful with their parent journey (period bucketing,
                 # dated selection, close_reason), so the parent table is always in scope with them.
                 if ("cross_app_journey_event" in selected and "cross_app_journey" not in selected
@@ -1333,12 +1624,12 @@ class AnalystAgent:
                 custom_tables[question] = selected[:5]
             elif action == "decompose":
                 parts = [str(p).strip() for p in decision.get("parts") or []
-                         if str(p).strip()][:4]
+                         if str(p).strip()][:understanding_lib.MAX_PARTS]
                 if not parts:
-                    raise ValueError("OpenAI returned an empty Deep-analysis plan")
+                    raise _PlanError("OpenAI returned an empty Deep-analysis plan")
             else:
-                raise ValueError("OpenAI returned an invalid Deep-analysis action")
-            parts = parts[:4]
+                raise _PlanError("OpenAI returned no usable Deep-analysis strategy")
+            parts = parts[:understanding_lib.MAX_PARTS]
             self._emit("plan", "Plan: " + " | ".join(f"{i}. {p}" for i, p in enumerate(parts, 1)))
             for c in cannot:
                 self._emit("plan", f"Not in the data: {c['part']} ({c.get('missing', '')})", ok=False)
@@ -1350,9 +1641,9 @@ class AnalystAgent:
                     route="unsupported", source="llm" if self.use_llm else "rules",
                     resolved=question, depth="deep", verified=False, reason=str(cannot[0].get("missing") or ""),
                     suggested_questions=self._available_questions())
-            for part in parts:
+            def answer_part(n: int, part: str) -> AnalystAnswer:
                 budget.check(reserve=6)
-                self._emit("query", f"Part {len(results) + 1}: {part}")
+                self._emit("query", f"Part {n}: {part}")
                 planned = routes.get(part)
                 if part in custom_tables:
                     tables = custom_tables[part]
@@ -1379,43 +1670,230 @@ class AnalystAgent:
                 self._compare(part, sub)
                 if interpretation and len(parts) == 1:
                     sub.notes.insert(0, f"Interpreted as: {interpretation}")
-                if sub.table and sub.table.get("rows"):
-                    issues = self._openai_verify_answer(part, sub, interpretation)
-                    summary, sep, table_only = sub.answer.partition("\n\nResult:\n")
-                    if issues and sep and summary.strip():
-                        # The rendered table is copied from the rows; only the model's summary sentence can
-                        # misstate a comparison. Drop it and verify the table alone before touching the SQL.
-                        self._emit("verify", "OpenAI rejected the summary: " + "; ".join(issues[:2])
-                                   + ". Re-checking the table without it", ok=False)
-                        sub.answer = "Result:\n" + table_only
-                        issues = self._openai_verify_answer(part, sub, interpretation)
-                    if issues and sub.route == "sql" and budget.remaining() > 18:
-                        self._emit("verify", "OpenAI rejected the answer: " + "; ".join(issues[:3])
-                                   + ". Repairing the query once", ok=False)
-                        repair_tables = custom_tables.get(part) or sub.tables
-                        repaired = self._free_sql(
-                            part, history, repair_tables,
-                            Route("sql", tables=repair_tables, confidence=1.0,
-                                  reason="OpenAI verification repair", source="llm"),
-                            [], strict_deep=part in custom_tables,
-                            feedback=(f"\n\nA previous query:\n{sub.sql}\nran, but OpenAI verification of its "
-                                      "answer found: " + "; ".join(issues[:4])
-                                      + "\nWrite a corrected query and reply with JSON."))
-                        if repaired.table and repaired.table.get("rows"):
-                            sub = repaired
-                            self._compare(part, sub)
-                            issues = self._openai_verify_answer(part, sub, interpretation)
-                    if issues:
-                        sub.verified = False
-                        sub.notes.extend("OpenAI verification: " + issue for issue in issues)
-                        self._emit("verify", "OpenAI rejected the answer: " + "; ".join(issues[:3]), ok=False)
-                    else:
-                        self._emit("verify", "OpenAI verified the answer against the query result")
+                return self._verify_part(part, sub, history, interpretation, custom_tables.get(part),
+                                         strict=part in custom_tables)
+
+            outcomes = self._parallel([lambda n=n, part=part: answer_part(n, part)
+                                       for n, part in enumerate(parts, 1)])
+            for part, outcome in zip(parts, outcomes):
+                if isinstance(outcome, ThinkingTimeout):
+                    timed_out = timed_out or str(outcome)
+                elif isinstance(outcome, BaseException):
+                    results.append((part, self._part_error(outcome)))
+                else:
+                    results.append((part, outcome))
+            if timed_out:
+                self._emit("stop", f"Stopped: {timed_out}. Using the parts finished so far.", ok=False)
+        except ThinkingTimeout as exc:
+            timed_out = str(exc)
+            self._emit("stop", f"Stopped: {exc}. Using the parts finished so far.", ok=False)
+        return self._assemble(parts, results, cannot, timed_out, interpretation)
+
+    def _verify_part(self, part: str, sub: AnalystAnswer, history: list[dict], interpretation: str = "",
+                     tables: list[str] | None = None, strict: bool = False) -> AnalystAnswer:
+        """OpenAI checks a part's answer against its own rows. A summary sentence it rejects is dropped (the rows
+        are copied, only the sentence can misstate them); a custom query it rejects is repaired once."""
+        budget = _RUN.get().budget
+        if not (sub.table and sub.table.get("rows")) or budget.no_llm:
+            return sub
+        issues = self._openai_verify_answer(part, sub, interpretation)
+        summary, sep, table_only = sub.answer.partition("\n\nResult:\n")
+        if issues and sep and summary.strip():
+            self._emit("verify", "OpenAI rejected the summary: " + "; ".join(issues[:2])
+                       + ". Re-checking the table without it", ok=False)
+            sub.answer = "Result:\n" + table_only
+            issues = self._openai_verify_answer(part, sub, interpretation)
+        if issues and sub.route == "sql" and budget.remaining() > 18:
+            self._emit("verify", "OpenAI rejected the answer: " + "; ".join(issues[:3])
+                       + ". Repairing the query once", ok=False)
+            repair_tables = tables or sub.tables
+            repaired = self._free_sql(
+                part, history, repair_tables,
+                Route("sql", tables=repair_tables, confidence=1.0, reason="OpenAI verification repair", source="llm"),
+                [], strict_deep=strict,
+                feedback=(f"\n\nA previous query:\n{sub.sql}\nran, but OpenAI verification of its answer found: "
+                          + "; ".join(issues[:4]) + "\nWrite a corrected query and reply with JSON."))
+            if repaired.table and repaired.table.get("rows"):
+                sub = repaired
+                self._compare(part, sub)
+                issues = self._openai_verify_answer(part, sub, interpretation)
+        if issues:
+            sub.verified = False
+            sub.notes.extend("OpenAI verification: " + issue for issue in issues)
+            self._emit("verify", "OpenAI rejected the answer: " + "; ".join(issues[:3]), ok=False)
+        else:
+            self._emit("verify", "OpenAI verified the answer against the query result")
+        return sub
+
+    # ====================================================== several questions in one message
+    def _answer_parts(self, u: understanding_lib.Understanding, history: list[dict], message: str) -> AnalystAnswer:
+        """Every question in the message gets its own numbered answer or a stated reason why not.
+
+        Answerable parts run in waves: independent ones side by side, a part that needs an earlier part's
+        result after it (rewritten with that result first). Parts needing the user's input, outside the data
+        or outside scope are reported, not run."""
+        outcomes: dict[int, parts_lib.Outcome] = {
+            p.number: parts_lib.Outcome(p.status, note=p.reason) for p in u.parts if p.status != "answer"}
+        runnable = [p for p in u.parts if p.status == "answer"]
+        self._emit("plan", f"{len(u.parts)} questions in the message: {len(runnable)} to answer now"
+                           + "".join(f", {n} {parts_lib.LABELS[s]}" for s, n in self._count(outcomes).items())
+                           + (f", {u.more_questions} beyond the limit of {understanding_lib.MAX_PARTS}"
+                              if u.more_questions else ""))
+        for wave in parts_lib.run_order(u.parts):
+            ready = []
+            for p in wave:
+                missing = [d for d in p.depends_on
+                           if d not in outcomes or outcomes[d].status not in ("answered", "flagged")]
+                if missing:
+                    outcomes[p.number] = parts_lib.Outcome("blocked", note=(
+                        f"it needs the result of question {', '.join(map(str, missing))}, which is not available."))
+                else:
+                    ready.append(p)
+            results = self._parallel([lambda p=p: self._run_part(p, u, outcomes, history) for p in ready])
+            for p, result in zip(ready, results):
+                outcomes[p.number] = self._part_outcome(p, result)
+        return self._assemble_parts(u, outcomes)
+
+    @staticmethod
+    def _count(outcomes: dict) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for o in outcomes.values():
+            counts[o.status] = counts.get(o.status, 0) + 1
+        return counts
+
+    def _run_part(self, p: understanding_lib.Part, u: understanding_lib.Understanding,
+                  outcomes: dict[int, parts_lib.Outcome], history: list[dict]) -> tuple[str, AnalystAnswer]:
+        self._emit("query", f"Question {p.number}: {p.question}")
+        if p.kind == "brief" and self._report_ready():
+            result = self._report(p.question, history, u)
+            for c in result.clarifications:
+                c["part"] = p.number
+            return p.question, result
+        question = self._resolve_dependent(p, outcomes) if p.depends_on else p.question
+        route = None if p.depends_on else self._reading_route(question, p.metric, p.metric_params, p, u.apps)
+        if route is not None:
+            self._emit("plan", f"Question {p.number}: vetted analysis {route.metric.title}")
+            sub = self._answer_one(question, history, {}, route, original=question)
+        elif p.tables and not p.depends_on and self.s.allow_free_sql:
+            sub = self._free_sql(question, history, p.tables,
+                                 Route("sql", tables=p.tables, confidence=1.0, source="llm"), [], strict_deep=True)
+        else:                                  # OpenAI chooses the analysis for this (possibly rewritten) part
+            sub = self._answer_one(question, history, {}, Route("sql", tables=[], confidence=0.0, source="llm"),
+                                   original=question)
+        self._compare(question, sub)
+        return question, self._verify_part(question, sub, history, tables=p.tables or None, strict=bool(p.tables))
+
+    def _resolve_dependent(self, p: understanding_lib.Part, outcomes: dict[int, parts_lib.Outcome]) -> str:
+        """Rewrite a part that needs earlier results ("the app with the highest conversion in part 1") with the
+        actual values from those results, so it can be answered on its own."""
+        memory = Memory()
+        for d in p.depends_on:
+            memory.remember(outcomes[d].question, outcomes[d].answer)
+        try:
+            raw = self._llm(system=RESOLVE_SYSTEM, user=memory.prompt() + f"New message: {p.question}\n"
+                            "Rewrite it as a standalone question, replacing what it takes from the earlier questions "
+                            "with the actual values in their results.",
+                            model=config.AGENT_MODEL, max_tokens=300, schema=RESOLVE_SCHEMA, cap=15, reserve=2)
+            text = str(parse_json(raw).get("question") or "").strip()
+        except (llm.OllamaError, ValueError, json.JSONDecodeError):
+            text = ""
+        if not text or len(text) > 600:
+            return p.question
+        self._emit("understand", f"Question {p.number} uses the answer to question "
+                                 f"{', '.join(map(str, p.depends_on))}: {text}")
+        return text
+
+    def _part_outcome(self, p: understanding_lib.Part, result) -> parts_lib.Outcome:
+        if isinstance(result, ThinkingTimeout):
+            return parts_lib.Outcome("not_finished")
+        if isinstance(result, BaseException):
+            return parts_lib.Outcome("failed", answer=self._part_error(result))
+        question, sub = result
+        rows = bool(sub.table and sub.table.get("rows")) or any(x.get("table") for x in sub.parts)
+        if sub.notes and sub.route not in ("clarify", "help"):
+            sub.answer += "\n\nNote: " + " ".join(dict.fromkeys(_sentence(n) for n in sub.notes
+                                                               if not n.startswith("OpenAI verification: ")))
+        if sub.route == "out_of_scope":
+            return parts_lib.Outcome("out_of_scope", sub, question=question)
+        if sub.route in ("unsupported", "data_gap"):
+            return parts_lib.Outcome("unsupported", sub, note=(sub.reason or sub.answer).strip().rstrip("."),
+                                     question=question)
+        if sub.route in ("metric", "proxy", "sql", "deep") and rows:
+            if sub.verified:
+                return parts_lib.Outcome("answered", sub, question=question)
+            if not sub.answer.startswith("**Check before relying on this."):
+                issues = [n.removeprefix("OpenAI verification: ") for n in sub.notes
+                          if n.startswith("OpenAI verification: ")]
+                sub.answer = ("**Check before relying on this.** The review flagged: "
+                              + ("; ".join(i.rstrip(".") for i in issues[:2]) if issues else "a possible mismatch")
+                              + ".\n\n" + sub.answer)
+            return parts_lib.Outcome("flagged", sub, question=question)
+        if sub.route in ("metric", "sql") and sub.table is not None:
+            return parts_lib.Outcome("no_rows", sub, question=question)
+        if sub.route == "timeout":
+            return parts_lib.Outcome("not_finished", sub, question=question)
+        return parts_lib.Outcome("failed", sub, question=question)
+
+    def _assemble_parts(self, u: understanding_lib.Understanding,
+                        outcomes: dict[int, parts_lib.Outcome]) -> AnalystAnswer:
+        blocks = [parts_lib.overview(u.parts, outcomes, u.more_questions)]
+        blocks += [parts_lib.section(p, outcomes[p.number]) for p in u.parts]
+        if u.more_questions:
+            blocks.append(parts_lib.more_note(u.more_questions))
+        answered = [outcomes[p.number].answer for p in u.parts if outcomes[p.number].status in ("answered", "flagged")]
+        first = answered[0] if answered else None
+        entries = []
+        for p in u.parts:
+            o = outcomes[p.number]
+            a = o.answer
+            entries.append({"question": f"{p.number}. {p.question}", "understood_as": o.question or p.question,
+                            "answer": parts_lib.body(p, o), "sql": getattr(a, "sql", None),
+                            "table": getattr(a, "table", None), "verified": o.status == "answered",
+                            "status": o.status, "label": parts_lib.LABELS[o.status]})
+            if p.kind == "brief" and a is not None:
+                entries += [{**x, "question": f"{p.number}. Brief · {x['question']}"} for x in a.parts]
+        ran = [o for o in outcomes.values() if o.status not in ("clarify", "unsupported", "out_of_scope")]
+        self._emit("write", f"Answer assembled: {len(answered)} of {len(u.parts)} questions answered")
+        return AnalystAnswer(
+            "\n\n".join(blocks), route="deep", source="llm", resolved=u.question,
+            metric=first.metric if first else None,
+            tables=list(dict.fromkeys(t for a in answered for t in a.tables)),
+            sql=first.sql if first else None, table=first.table if first else None,
+            timed_out=any(o.status == "not_finished" for o in outcomes.values()), depth="deep",
+            verified=bool(answered) and all(o.status == "answered" for o in ran),
+            clarifications=u.clarifications + [c for o in outcomes.values() if o.answer is not None
+                                               for c in (o.answer.clarifications or []) if c not in u.clarifications],
+            state=first.state if len(answered) == 1 else {}, parts=entries)
+
+    def _local_parts(self, rule_parts: list[tuple[str, Route | None]], history: list[dict]) -> AnalystAnswer:
+        """Multi-part question without OpenAI: answer each rule-split part as its own Fast question."""
+        budget = _RUN.get().budget
+        parts = [part for part, _ in rule_parts]
+        results: list[tuple[str, AnalystAnswer]] = []
+        timed_out = None
+        self._emit("plan", "Answering each part separately (Deep planning needs OpenAI): "
+                           + " | ".join(f"{i}. {p}" for i, p in enumerate(parts, 1)))
+        try:
+            for part, planned in rule_parts:
+                budget.check(reserve=6)
+                self._emit("query", f"Part {len(results) + 1}: {part}")
+                if planned is None:
+                    # The full Fast path, so each part gets the same scope, period and shape checks
+                    # it would get if it had been asked on its own.
+                    sub = self._ask(part, history, {}, "fast")
+                else:
+                    sub = self._answer_one(part, history, {}, planned)
+                    self._compare(part, sub)
                 results.append((part, sub))
         except ThinkingTimeout as exc:
             timed_out = str(exc)
             self._emit("stop", f"Stopped: {exc}. Using the parts finished so far.", ok=False)
+        return self._assemble(parts, results, [], timed_out)
 
+    def _assemble(self, parts: list[str], results: list[tuple[str, AnalystAnswer]], cannot: list[dict],
+                  timed_out: str | None, interpretation: str = "") -> AnalystAnswer:
+        """One answer from the per-part answers: each part keeps its own figures, nothing is re-worded."""
+        budget = _RUN.get().budget
         good = [(p, r) for p, r in results
                 if r.route in ("metric", "proxy", "sql") and r.table is not None
                 and bool(r.table.get("rows")) and r.verified]
@@ -1474,12 +1952,340 @@ class AnalystAgent:
             tables=list(dict.fromkeys(t for _, r in good for t in r.tables)), sql=first.sql if first else None,
             table=first.table if first else None, timed_out=bool(timed_out), depth="deep",
             verified=bool(good) and not (cannot or failed or timed_out),
-            notes=([f"cannot answer: {c['part']}" for c in cannot]
+            # A single part carries the interpretation in its own notes; several parts share this one.
+            notes=(([f"Interpreted as: {interpretation}"] if interpretation and len(parts) > 1 else [])
+                   + [f"cannot answer: {c['part']}" for c in cannot]
                    + [f"not verified: {part}" for part in failed]
                    + (["analysis timed out before completion"] if timed_out else [])),
             state=first.state if len(good) == 1 and first else {},
             parts=[{"question": p, "understood_as": r.resolved, "answer": r.answer, "sql": r.sql,
                     "table": r.table, "verified": (p, r) in good} for p, r in results])
+
+    # ========================================================== briefs
+    def _report_ready(self) -> bool:
+        metric = self.cat.metrics.get(report_lib.SCORECARD)
+        return metric is not None and metric.available
+
+    def _report(self, question: str, history: list[dict],
+                understood: "understanding_lib.Understanding | None" = None) -> AnalystAnswer:
+        """An executive-summary brief: a validated scope, one vetted scorecard per breakdown (side by side),
+        findings computed from the rows, and a summary whose every sentence is checked against them."""
+        run = _RUN.get()
+        budget = run.budget
+        metric = self.cat.metrics[report_lib.SCORECARD]
+        if metric.name in self.cat.metric_issues:
+            return AnalystAnswer(f"I cannot build this brief reliably yet. {self.cat.metric_issues[metric.name]}",
+                                 route="data_gap", resolved=question, depth="deep", verified=False,
+                                 metric=metric.name, tables=metric.tables)
+        self._emit("plan", "Executive-summary brief: setting its scope, then one exact scorecard per breakdown")
+        if understood is not None:
+            # OpenAI already read the brief (who 'we' is, period, categories, splits): no rules, no second call.
+            scope = report_lib.build_scope(
+                question, understood.scope_plan(), apps=self.cat.apps, home_app=self.cat.home_app, stated_app=None,
+                levels=self.cat.category_levels, extracted=None, date_range=self.cat.date_range,
+                paths=self.cat.category_paths, use_rules=False)
+            plan = understood
+        else:
+            plan = (self._report_scope(question, history) if config.LLM_PROVIDER == "openai" and self.use_llm
+                    else None)
+            scope = report_lib.build_scope(
+                question, plan, apps=self.cat.apps, home_app=self.cat.home_app,
+                stated_app=run.home if run.home_stated else None, carried_app=None if run.home_stated else run.home,
+                levels=self.cat.category_levels, extracted=self.router.extract(question),
+                date_range=self.cat.date_range, paths=self.cat.category_paths)
+        self._emit("plan", f"Scope: {scope.focus_app} as 'we' ({scope.focus_reason}); {scope.period()}; "
+                           f"{scope.window_hours}-hour purchase window; groups of at least {scope.min_users} users"
+                           + ("" if scope.min_users_stated else " (default)"))
+        for asked, values in scope.category_map.items():
+            self._emit("plan", f"Category '{asked}' = {', '.join(values)}")
+        for note in scope.category_notes:
+            self._emit("plan", note, ok=False)
+        for asked, close in scope.unresolved.items():
+            self._emit("plan", f"No category in the data means '{asked}'"
+                               + (f" (closest: {', '.join(close)})" if close else ""), ok=False)
+        self._emit("plan", "Breakdowns: " + ", ".join(report_lib.label(b) for b in scope.breakdowns))
+
+        if scope.category_map:
+            metric = replace(
+                metric, dimensions={**metric.dimensions,
+                                    "requested_category": report_lib.requested_category_sql(scope.category_map)},
+                params=[replace(p, values=[*p.values, "requested_category"]) if p.name == "dimension" else p
+                        for p in metric.params])
+        keep_back = min(20.0, budget.seconds * 0.3)          # time left for the summary after the queries
+        params = scope.params()
+        # Measures the scorecard does not hold (visitors, switching to a competitor app) come from sessions.
+        wanted = [m for m in (understood.measures if understood is not None else [])
+                  if m in report_lib.SESSION_MEASURES]
+        extras = [(m, self.cat.metrics.get(report_lib.SESSION_MEASURES[m][0])) for m in wanted]
+        extras = [(m, x) for m, x in extras if x is not None and x.available and x.name not in self.cat.metric_issues]
+        dated = {k: v for k, v in (("date_from", scope.date_from), ("date_to", scope.date_to)) if v}
+        outcomes = self._parallel(
+            [lambda b=b: self._run_scorecard(metric, {**params, "dimension": b}, report_lib.label(b), keep_back)
+             for b in scope.breakdowns]
+            + [lambda x=x, m=m: self._run_scorecard(x, dict(dated), report_lib.SESSION_MEASURES[m][1], keep_back)
+               for m, x in extras], limit=max(PART_CONCURRENCY, 8))      # short read-only queries, no model calls
+        session_outcomes = outcomes[len(scope.breakdowns):]
+        outcomes = outcomes[:len(scope.breakdowns)]
+
+        timed_out = next((str(o) for o in outcomes + session_outcomes if isinstance(o, ThinkingTimeout)), None)
+        done: list[tuple[str, AnalystAnswer]] = []
+        for b, outcome in zip(scope.breakdowns, outcomes):
+            if isinstance(outcome, ThinkingTimeout):
+                outcome = AnalystAnswer(f"Not run: {outcome}.", route="timeout", verified=False)
+            elif isinstance(outcome, BaseException):
+                outcome = self._part_error(outcome)
+            done.append((b, outcome))
+        tables = {b: r.table for b, r in done if r.table and r.table.get("rows")}
+        overall = (report_lib.focus_row(tables["overall"]["columns"], tables["overall"]["rows"], scope.focus_app)
+                   if "overall" in tables else None)
+        found: list[report_lib.Finding] = []
+        for b, _ in done:
+            if b in tables:
+                found += report_lib.findings(b, tables[b]["columns"], tables[b]["rows"], scope.focus_app,
+                                             self.cat.app_parents, scope.min_users, overall)
+        tested = sum(f.p is not None for f in found)
+        candidates = list(found)
+        found, chance = report_lib.keep_significant(found)
+        significant = [f for f in found if f.p is not None]
+        sessions: list[tuple[str, str, AnalystAnswer]] = []
+        for (m, x), outcome in zip(extras, session_outcomes):
+            if isinstance(outcome, BaseException):
+                outcome = self._part_error(outcome)
+            sessions.append((m, report_lib.SESSION_MEASURES[m][1], outcome))
+            table = outcome.table or {}
+            fact = report_lib.session_fact(m, table.get("columns") or [], table.get("rows") or [], scope.focus_app)
+            if fact is not None:
+                found.append(fact)
+        found += [report_lib.Finding("", "context", "data", "", detail, [])
+                  for detail in self._report_caveats(metric, scope)]
+        if not significant:
+            # Nothing passed the test: the largest gaps may still motivate a test, labelled as possible chance.
+            found += report_lib.directional(candidates, found)
+        found = report_lib.number_findings(found)
+        self._emit("verify", f"{len(tables)} of {len(done)} scorecards returned rows; {tested} gaps of "
+                             f"{report_lib.GAP_PTS:g} point or more tested, {len(significant)} statistically "
+                             f"significant (Fisher's exact test, {report_lib.FDR:.0%} false-discovery rate)")
+
+        summary, written, dropped = report_lib.computed_summary(found), False, []
+        citable = [f for f in found if f.kind in ("lead", "behind", "weak", "directional", "context")]
+        if citable and self.use_llm and not budget.no_llm and not llm.recently_unavailable():
+            try:
+                raw = self._llm(
+                    system=report_lib.SUMMARY_SYSTEM.format(focus_app=scope.focus_app),
+                    user=f"Brief: {question}\n\nFindings:\n" + "\n".join(f"{f.id} [{f.kind}] {f.text}" for f in found),
+                    model=config.ANSWER_MODEL, max_tokens=1500, schema=report_lib.SUMMARY_SCHEMA, cap=40, reserve=1)
+                kept, dropped = report_lib.validated_summary(parse_json(raw), {f.id: f for f in found}, self.cat.apps)
+                if kept:
+                    summary = {**{k: v for k, v in summary.items() if k not in kept}, **kept}
+                    written = True
+                for d in dropped:
+                    self._emit("verify", f"Summary sentence dropped: {d}", ok=False)
+                self._emit("verify", "Summary checked: every sentence repeats only its cited findings' numbers, "
+                                     "apps and segments")
+            except Exception as exc:          # noqa: BLE001 - the computed findings stand without the wording
+                log.info("brief summary not written", exc_info=True)
+                self._emit("write", f"Summary written from the computed findings only ({exc})", ok=False)
+
+        family = self.cat.app_parents
+        compared = {b: report_lib.compared_groups(t["columns"], t["rows"], scope.focus_app, family)
+                    for b, t in tables.items()}
+        empty = [b for b, r in done if r.route == "metric" and b not in tables]      # ran; no group reached the base
+        failed = [b for b, r in done if r.route != "metric"]                         # error or out of time
+        lines = [f"**{scope.focus_app}: executive summary, {scope.period()}**",
+                 f"Journeys that started on each app, {scope.window_hours}-hour purchase window, finished windows "
+                 f"only. Groups with fewer than {scope.min_users} users are left out, and a gap is reported only "
+                 f"when it is statistically significant (Fisher's exact test, {report_lib.FDR:.0%} "
+                 "false-discovery rate across the brief). Within a category every competitor is compared; across "
+                 "categories the benchmark is the biggest competitor, since apps selling different things "
+                 "convert at different rates."]
+        if scope.category_map:
+            lines.append("Categories: " + "; ".join(scope.category_labels[asked] for asked in scope.category_map)
+                         + ".")
+        lines += scope.category_notes
+        if scope.unresolved:
+            lines.append("**Not in the data, left out:** " + "; ".join(
+                f"'{asked}'" + (f" (closest names: {', '.join(close)})" if close else "")
+                for asked, close in scope.unresolved.items())
+                + (". With no named category found, the brief covers all categories." if not scope.category_map
+                   else "."))
+        lines.append("**Measures:** people who started a product search on each app (users and journeys), "
+                     "purchasers (converted journeys), conversion rate, retention, and cross-app switching as "
+                     "purchases made on another app (leaked %)"
+                     + (", plus " + " and ".join(label.lower() for _, label, _ in sessions)
+                        + " for all categories, because sessions carry no category" if sessions else "") + ".")
+        lines += scope.unavailable
+        lines += [f"**Data caveat ({f.id}):** {f.text}" for f in found if f.kind == "context" and f.breakdown == "data"]
+        session_lines = [f"{f.id}: {f.text}" for f in found if f.kind == "context" and f.breakdown != "data"]
+        if session_lines:
+            lines.append("**Visitors and app switching**\n" + "\n".join(f"- {line}" for line in session_lines))
+        if overall is None and tables:
+            lines.append(f"**{scope.focus_app} has fewer than {scope.min_users} users** (period: {scope.period()}), "
+                         "so it cannot be compared with its competitors.")
+        elif tables and not any(compared.values()):
+            # Not "no difference": nothing was compared. Saying otherwise reads as parity with competitors.
+            lines.append(f"**No competitor reached {scope.min_users} users in any group where {scope.focus_app} "
+                         "did**, so nothing could be compared. A longer period, all categories or a smaller "
+                         "minimum group gives a bigger base (suggestions below).")
+        body = report_lib.render_summary(summary, scope, proven=bool(significant))
+        gaps = any(f.kind in ("lead", "behind") for f in found)
+        if body:
+            lines.append(body)
+        if any(compared.values()) and not gaps:
+            lines.append(f"**No gap between {scope.focus_app} and its competitors is statistically reliable** in the "
+                         f"{sum(compared.values())} groups where both reached {scope.min_users} users: at these "
+                         "group sizes the differences could be chance.")
+        if chance and (gaps or body):
+            lines.append(f"{chance} other gap{'s' if chance != 1 else ''} of {report_lib.GAP_PTS:g} point or more "
+                         "could be chance at these group sizes and "
+                         f"{'are' if chance != 1 else 'is'} not reported (each breakdown's table shows every group).")
+        if empty:
+            lines.append(f"Too few people to compare (under {scope.min_users} per group) by: "
+                         + ", ".join(report_lib.label(b) for b in empty) + ". The data has these fields; "
+                         "the period is too short for groups this size.")
+        lines.append("Finding ids and every breakdown's table (with a chart) are under \u201cHow this was "
+                     "calculated\u201d." + (" Every summary sentence was checked against the findings it cites; "
+                                            "actions are suggestions." if written else ""))
+        if timed_out:
+            lines.append("The time limit was reached before every breakdown finished; allow more thinking time "
+                         "for the full brief.")
+        thin = bool(empty) or not any(compared.values()) or not (gaps or body)
+
+        def part_text(b: str, r: AnalystAnswer) -> str:
+            if b in empty:
+                return f"No group reached {scope.min_users} users, so there is nothing to show."
+            if b not in tables:
+                return r.answer or "Not answered."
+            mine = [f"{f.id}: {f.text}" for f in found if f.breakdown == b]
+            if compared.get(b) and not any(f.breakdown == b and f.kind in ("lead", "behind") for f in found):
+                mine.append(f"No statistically reliable gap between {scope.focus_app} and its competitors in the "
+                            f"{compared[b]} groups where both reached {scope.min_users} users.")
+            return "\n".join(mine) or "Nothing to compare."
+
+        first = tables.get("overall") or next(iter(tables.values()), None)
+        return AnalystAnswer(
+            "\n\n".join(lines), route="deep", source="llm" if (plan or written) else "rules",
+            resolved=f"{metric.title}: " + ", ".join(report_lib.label(b) for b in scope.breakdowns),
+            metric=metric.name, params=params, tables=list(dict.fromkeys(t for _, r in done for t in r.tables)),
+            sql=next((r.sql for b, r in done if b == "overall"), None), table=first,
+            timed_out=bool(timed_out), depth="deep", verified=bool(tables) and not failed and not timed_out,
+            notes=[f"Not answered: {report_lib.label(b)}" for b in failed]
+                  + [f"Not answered: {label}" for _, label, r in sessions if r.route != "metric"],
+            follow_ups=report_lib.wider_questions(scope, self.cat.date_range) if thin else [],
+            clarifications=report_lib.category_clarifications(scope, self.cat.category_paths),
+            parts=[{"question": report_lib.label(b), "understood_as": r.resolved, "answer": part_text(b, r),
+                    "sql": r.sql, "table": r.table, "verified": b in tables or b in empty} for b, r in done]
+                  + [{"question": label, "understood_as": r.resolved,
+                      "answer": "\n".join(f"{f.id}: {f.text}" for f in found
+                                          if f.kind == "context" and f.breakdown == ("visitors" if m == "visitors"
+                                                                                       else "switching"))
+                                or r.answer or "No sessions in this period.",
+                      "sql": r.sql, "table": r.table, "verified": r.route == "metric"} for m, label, r in sessions])
+
+    def _report_caveats(self, metric: MetricDoc, scope: report_lib.Scope) -> list[str]:
+        """Data-quality warnings that bear on the scorecard's figures (e.g. purchases that are not linked)."""
+        out = []
+        for issue in self.cat.quality_issues:
+            if issue.get("code") == "stale_is_final" or not set(issue.get("tables") or []) & set(metric.tables):
+                continue                     # is_final is never used; the definitions already avoid it
+            start = self.cat.category_comparable_from
+            if issue.get("code") == "category_taxonomy_change" and start and (scope.date_from or "") >= start:
+                continue                     # the whole period uses the current categories
+            if issue.get("detail"):
+                out.append(issue["detail"])
+        return out
+
+    def _report_scope(self, question: str, history: list[dict]) -> dict | None:
+        """The model's reading of the brief (which app, period, categories, splits); validated by the caller."""
+        self._emit("understand", "Reading the brief: who 'we' is, the period, the categories and the splits")
+        first, last = self.cat.date_range
+        try:
+            raw = self._llm(
+                system=report_lib.SCOPE_SYSTEM.format(
+                    home_app=self.cat.home_app, apps=", ".join(self.cat.apps), first_day=first, last_day=last,
+                    breakdowns=", ".join(report_lib.BREAKDOWNS),
+                    categories=report_lib.category_menu(self.cat.category_tree)),
+                user=self._history_text(history) + f"Brief: {question}",
+                model=config.AGENT_MODEL, max_tokens=1200, schema=report_lib.SCOPE_SCHEMA, cap=25, reserve=10)
+            return parse_json(raw)
+        except (llm.OllamaError, ThinkingTimeout, ValueError, json.JSONDecodeError) as exc:
+            self._emit("plan", f"Could not read the brief with the model ({exc}); using the rules alone", ok=False)
+            return None
+
+    def _run_scorecard(self, metric: MetricDoc, params: dict, label: str, keep_back: float) -> AnalystAnswer:
+        try:
+            resolved = metric_lib.resolve_params(metric, params, self.cat)
+            checked = guard.check(metric_lib.render(metric, resolved), self.cat, dialect=self.source.dialect,
+                                  max_rows=self.s.max_rows, schema=self.s.db_schema)
+        except (metric_lib.MetricError, guard.GuardError) as exc:
+            return AnalystAnswer(f"Could not run this breakdown: {exc}", route="error", verified=False,
+                                 metric=metric.name)
+        self._emit("query", f"Scorecard by {label}")
+        try:
+            result = self._execute(checked.sql, reserve=keep_back)
+        except SourceError as exc:
+            self._emit("verify", f"{label}: the database rejected the query ({str(exc)[:200]})", ok=False)
+            return AnalystAnswer(f"The query failed on the database ({str(exc)[:200]}).", route="error",
+                                 metric=metric.name, params=resolved, tables=checked.tables, sql=checked.sql,
+                                 verified=False)
+        self._emit("verify", f"{label}: {len(result.rows)} rows" + (" (row limit reached)" if result.truncated else ""))
+        return AnalystAnswer("", route="metric", resolved=f"{metric.title} by {label}", metric=metric.name,
+                             params=resolved, tables=checked.tables, sql=checked.sql, table=result.as_table(),
+                             verified=True)
+
+    # ========================================================== helpers
+    def _parallel(self, jobs: list[Callable[[], object]], limit: int | None = None) -> list[object]:
+        """Run independent jobs side by side; each sees this request's context (budget, trace, who 'we' is).
+        A job's exception is returned in its place, so one failed part never discards the others."""
+        def guarded(job):
+            try:
+                return job()
+            except BaseException as exc:          # noqa: BLE001 - handed back to the caller per job
+                return exc
+
+        if len(jobs) <= 1 or threading.current_thread().name.startswith("analyst-part"):
+            return [guarded(job) for job in jobs]
+        limit = max(1, limit or PART_CONCURRENCY)
+        results: list[object] = [None] * len(jobs)
+        queue = iter(enumerate(jobs))
+        running: dict = {}
+
+        def start_next() -> None:
+            nxt = next(queue, None)
+            if nxt is not None:
+                running[_PARTS.submit(contextvars.copy_context().run, guarded, nxt[1])] = nxt[0]
+
+        for _ in range(limit):
+            start_next()
+        while running:
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                results[running.pop(future)] = future.result()
+                start_next()
+        return results
+
+    def _part_error(self, exc: BaseException) -> AnalystAnswer:
+        if isinstance(exc, llm.OllamaError):
+            text = f"The language model was not reachable for this part ({exc})."
+        elif isinstance(exc, SourceError):
+            text = f"The database rejected this part ({str(exc)[:200]})."
+        else:
+            log.error("part failed", exc_info=exc)
+            text = "This part failed with an internal error."
+        return AnalystAnswer(text, route="error", verified=False)
+
+    def _adopt_home(self, question: str, state: dict, run: _Run):
+        """'I'm Flipkart's insights lead' makes Flipkart 'we' for this chat. Returns the context token to reset."""
+        stated = report_lib.stated_home_app(question, self.cat.apps)
+        carried = state.get("home_app") if state.get("home_app") in self.cat.apps else None
+        home = stated or carried
+        if not home:
+            return None
+        run.home, run.home_stated = home, bool(stated)
+        run.home_reason = f"you wrote as {home}" if stated else f"you wrote as {home} earlier in this chat"
+        if home == self.cat.home_app:
+            return None
+        self._emit("understand", f"'We / our' means {home} here ({run.home_reason})")
+        return HOME_OVERRIDE.set(home)
 
     def _deep_plan(self, question: str, history: list[dict]) -> dict:
         """OpenAI's strategy JSON, normalised; asks once more when the reply has no usable action."""
@@ -1487,24 +2293,28 @@ class AnalystAgent:
             metrics=self.cat.metric_menu(), tables=self.cat.table_menu(),
             schema=self.cat.schema_card(sorted(self.cat.allowed_tables), with_notes=False),
             first_day=self.cat.date_range[0], last_day=self.cat.date_range[1], week_start=self._week_start(),
-            home_app=self.s.home_app, glossary=self.cat.glossary[:4000])
-        user = self._history_text(history) + f"Current question: {question}" + self._route_hint(question)
+            home_app=self.cat.home_app, glossary=self.cat.glossary[:4000])
+        run = _RUN.get()
+        hint = (f"\nQuestion understanding (OpenAI, this turn): {run.understanding.summary()}."
+                if run is not None and run.understanding is not None else self._route_hint(question))
+        user = self._history_text(history) + f"Current question: {question}" + hint
         decision: dict = {}
         for attempt in range(2):
-            raw = self._llm(system=system, user=user, model=config.AGENT_MODEL, max_tokens=700,
-                            schema=DEEP_PLAN_SCHEMA, cap=20, reserve=10)
+            raw = self._llm(system=system, user=user, model=config.AGENT_MODEL, max_tokens=1500,
+                            schema=DEEP_PLAN_SCHEMA, cap=25, reserve=10)
             try:
                 decision = _normalise_plan(parse_json(raw), self.cat)
             except (ValueError, json.JSONDecodeError):
                 decision = {}
-            if decision.get("action") in ("metric", "custom_sql", "decompose", "unsupported"):
+            if decision.get("action") in ("metric", "custom_sql", "decompose", "report", "unsupported"):
                 return decision
             self._emit("plan", "OpenAI's strategy had no usable action; asking again", ok=False)
             user += ("\n\nYour previous reply was not a valid strategy. Reply with ONE JSON object whose \"action\" "
-                     "is metric, custom_sql, decompose or unsupported, plus reason and interpretation.")
+                     "is metric, custom_sql, decompose, report or unsupported, plus reason and interpretation.")
         return decision
 
-    def _model_metric_params(self, metric: MetricDoc, raw, question: str) -> tuple[dict, list[str], list[str]]:
+    def _model_metric_params(self, metric: MetricDoc, raw, question: str,
+                             focus: list[str] | None = None) -> tuple[dict, list[str], list[str]]:
         """A model's parameters for ``metric``: (params, apps to highlight, apps that need one run each).
 
         Models write "our X vs Meesho and Flipkart" as ONE app parameter holding several apps ("Amazon,
@@ -1513,7 +2323,12 @@ class AnalystAgent:
         metric is run once per app.
         """
         params = {k: v for k, v in (raw if isinstance(raw, dict) else {}).items() if metric.param(k)}
-        _, focus = self.router._params_for(metric, self.router.extract(question), question)
+        run = _RUN.get()
+        if focus is None and run is not None and run.understanding is not None:
+            focus = list(run.understanding.apps) if metric.focus_parameter == "app" else []
+        if focus is None:
+            _, focus = self.router._params_for(metric, self.router.extract(question), question)
+        focus = list(focus)
         per_app: list[str] = []
         for p in metric.params:
             if p.type != "app" or p.name not in params:
@@ -1555,7 +2370,11 @@ class AnalystAgent:
         return (anchor - timedelta(days=anchor.weekday())).isoformat()
 
     def _hint_route(self, question: str, original: str = "") -> Route | None:
-        """The keyword router's vetted metric for a question, when it plausibly answers it."""
+        """The vetted metric that plausibly answers a question: OpenAI's choice when it read the question,
+        else the keyword router's."""
+        run = _RUN.get()
+        if run is not None and run.understanding is not None:
+            return self._understood_route(run.understanding)
         route, _ = self.router.route(question)
         metric = route.metric
         if (metric is None or route.confidence < 0.35 or not metric.available
@@ -1569,19 +2388,6 @@ class AnalystAgent:
             return ""
         return (f"\nKeyword-match hint: vetted metric '{route.metric.name}' ({route.metric.title}), "
                 f"params {route.params}, confidence {route.confidence:.2f}.")
-
-    def _deep_query_tables(self, question: str, route: Route) -> list[str]:
-        """Choose rich but bounded table context for a Deep-mode joined query."""
-        preferred: list[str] = []
-        low = question.lower()
-        if re.search(r"\b(journey|journeys|purchase|purchased|multi[- ]app|search|user)\b", low):
-            preferred.extend(("cross_app_journey", "cross_app_journey_event"))
-        preferred.extend(route.tables)
-        if re.search(r"\b(session|sessions|screen|screens)\b", low):
-            preferred.append("session_master")
-        preferred.append("app_master")
-        return [name for name in dict.fromkeys(preferred)
-                if name in self.cat.allowed_tables][:5]
 
     def _normalise_deep_part(self, item) -> tuple[str, Route | None] | None:
         """Accept string plans and defensively handle model metric objects.
@@ -1600,7 +2406,7 @@ class AnalystAgent:
         metric = self.cat.metrics.get(metric_name)
         if metric is None:
             return (question, None) if question else None
-        params = {k: (self.s.home_app if isinstance(v, str) and v.upper() == "HOME" else v)
+        params = {k: (self.cat.home_app if isinstance(v, str) and v.upper() == "HOME" else v)
                   for k, v in (item.get("params") or {}).items() if metric.param(k)}
         label = question or metric.title
         if not question:
@@ -1622,9 +2428,6 @@ class AnalystAgent:
             if len(questions) >= limit:
                 break
         return questions
-
-    def _split_by_rules(self, question: str, route: Route | None = None) -> list[str]:
-        return [text for text, _ in self._rule_parts(question, route)]
 
     def _rule_parts(self, question: str, route: Route | None = None) -> list[tuple[str, Route | None]]:
         """Split without the model: bullet/line/'?' parts, or one part per requested dimension."""
@@ -1754,19 +2557,20 @@ class AnalystAgent:
             except Exception:
                 log.debug("on_event failed", exc_info=True)
 
-    def _llm(self, reserve: float = 1.0, cap: float | None = None, **kwargs) -> str:
+    def _llm(self, reserve: float = 1.0, cap: float | None = None, call: Callable | None = None, **kwargs):
         if not self.use_llm:
             raise llm.OllamaError("language model disabled")
+        call = call or llm.complete
         run = _RUN.get()
         if run is None:
-            return llm.complete(**kwargs)
+            return call(**kwargs)
         if run.budget.no_llm:
             raise ThinkingTimeout("the thinking limit was reached")
         run.budget.check(reserve)
         allowed = run.budget.remaining() - run.budget.scaled(reserve)
         if cap:
             allowed = min(allowed, cap)
-        future = _POOL.submit(llm.complete, timeout=allowed, **kwargs)
+        future = _POOL.submit(call, timeout=allowed, **kwargs)
         while True:
             try:
                 return future.result(timeout=0.25)
@@ -1783,6 +2587,14 @@ class AnalystAgent:
 # --------------------------------------------------------------------------- #
 # Deterministic rendering
 # --------------------------------------------------------------------------- #
+
+def _sentence(note: str) -> str:
+    note = str(note).strip()
+    if not note:
+        return note
+    note = note[0].upper() + note[1:]
+    return note if note[-1] in ".!?)" else note + "."
+
 
 def _fmt(col: str, value) -> str:
     if value is None:

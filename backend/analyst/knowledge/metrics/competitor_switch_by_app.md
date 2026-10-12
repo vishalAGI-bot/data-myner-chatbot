@@ -39,7 +39,8 @@ Share of app sessions where the user switched to a competitor app within 5 minut
 
 ## Caveats
 
-The app is taken from session_id; dates use the record created time.
+The app and the visit day are taken from session_id (its start time); created_at is only the record load time and
+is never used as the visit date.
 
 # Computation
 
@@ -53,8 +54,12 @@ SELECT split_part(s.session_id, '_', 2) AS app,
 FROM session_master s
 WHERE COALESCE(s.insignificant_session, false) = false
   [[ AND split_part(s.session_id, '_', 2) = :app ]]
-  [[ AND CAST(s.created_at AS date) >= CAST(:date_from AS date) ]]
-  [[ AND CAST(s.created_at AS date) <= CAST(:date_to AS date) ]]
+  [[ AND split_part(s.session_id, '_', 3) ~ '^20[0-9]{6}T[0-9]{6}'
+     AND CAST(substr(split_part(s.session_id, '_', 3), 1, 4) || '-' || substr(split_part(s.session_id, '_', 3), 5, 2)
+              || '-' || substr(split_part(s.session_id, '_', 3), 7, 2) AS date) >= CAST(:date_from AS date) ]]
+  [[ AND split_part(s.session_id, '_', 3) ~ '^20[0-9]{6}T[0-9]{6}'
+     AND CAST(substr(split_part(s.session_id, '_', 3), 1, 4) || '-' || substr(split_part(s.session_id, '_', 3), 5, 2)
+              || '-' || substr(split_part(s.session_id, '_', 3), 7, 2) AS date) <= CAST(:date_to AS date) ]]
 GROUP BY 1
 ORDER BY sessions DESC, 1
 ```

@@ -4,6 +4,7 @@ The provider is selected explicitly with ``LLM_PROVIDER``.  Embeddings remain
 local in Ollama even when OpenAI is used for text generation.
 """
 
+import json
 import re
 import requests
 
@@ -155,6 +156,59 @@ def _openai_health(api_key: str = "", model: str = "") -> tuple[bool, str]:
     return True, f"OpenAI ready ({model})"
 
 
+def call_tool(system: str, user: str, name: str, description: str, parameters: dict,
+              max_tokens: int = 2000, timeout: float = None) -> dict:
+    """OpenAI function calling: the model must call the tool ``name``; returns the arguments it filled in."""
+    if config.LLM_PROVIDER != "openai":
+        raise LLMError("Tool calling needs the OpenAI provider.")
+    limit = min(timeout, config.OPENAI_TIMEOUT) if timeout else config.OPENAI_TIMEOUT
+    if limit <= 0:
+        raise LLMError("No time left in the thinking budget")
+    request = {
+        "model": config.OPENAI_MODEL,
+        "instructions": system,
+        "input": user,
+        "max_output_tokens": max_tokens,
+        "store": False,
+        "reasoning": {"effort": config.OPENAI_REASONING_EFFORT},
+        "tools": [{"type": "function", "name": name, "description": description, "parameters": parameters,
+                   "strict": False}],
+        "tool_choice": {"type": "function", "name": name},
+    }
+    response = _openai_create(request, limit)
+    if _cut_off(response):
+        request["max_output_tokens"] = min(max_tokens * 2, 16000)
+        response = _openai_create(request, limit)
+        if _cut_off(response):
+            raise LLMError(f"OpenAI's {name} call was cut off at the {request['max_output_tokens']}-token limit.")
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) == "function_call" and getattr(item, "name", None) == name:
+            try:
+                arguments = json.loads(getattr(item, "arguments", None) or "{}")
+            except json.JSONDecodeError as exc:
+                raise LLMError(f"OpenAI's {name} call had unreadable arguments.") from exc
+            if not isinstance(arguments, dict):
+                raise LLMError(f"OpenAI's {name} call had unreadable arguments.")
+            return arguments
+    raise LLMError(f"OpenAI did not call the {name} tool.")
+
+
+def _openai_create(request: dict, limit: float):
+    try:
+        return _openai_client(timeout=limit).responses.create(**request)
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"OpenAI request failed: {type(exc).__name__}. "
+                       "Check the API key, model access, and network.") from exc
+
+
+def _cut_off(response) -> bool:
+    details = getattr(response, "incomplete_details", None)
+    return (getattr(response, "status", None) == "incomplete"
+            and getattr(details, "reason", None) == "max_output_tokens")
+
+
 def _complete_openai(system: str, user: str, max_tokens: int, schema: dict | None,
                      timeout: float | None) -> str:
     limit = min(timeout, config.OPENAI_TIMEOUT) if timeout else config.OPENAI_TIMEOUT
@@ -178,12 +232,14 @@ def _complete_openai(system: str, user: str, max_tokens: int, schema: dict | Non
             # Existing app schemas intentionally contain optional properties.
             "strict": False,
         }}
-    try:
-        response = _openai_client(timeout=limit).responses.create(**request)
-    except LLMError:
-        raise
-    except Exception as exc:
-        raise LLMError(f"OpenAI request failed: {type(exc).__name__}. Check the API key, model access, and network.") from exc
+    response = _openai_create(request, limit)
+    if _cut_off(response):
+        # A reply cut off at the output limit is broken JSON or half a SQL query, which used to surface as
+        # "could not be parsed" or "no valid plan". Ask once more with room to finish.
+        request["max_output_tokens"] = min(max_tokens * 2, 16000)
+        response = _openai_create(request, limit)
+        if _cut_off(response):
+            raise LLMError(f"OpenAI's reply was cut off at the {request['max_output_tokens']}-token output limit.")
     text = getattr(response, "output_text", "") or ""
     if not text.strip():
         raise LLMError("OpenAI returned no text output.")

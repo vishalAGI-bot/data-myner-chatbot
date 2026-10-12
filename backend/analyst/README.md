@@ -46,6 +46,46 @@ Column policies: `ok` · `aggregate_only` (e.g. date_of_birth: usable for age gr
 
 ## 2. How a question is answered
 
+**With OpenAI selected, OpenAI reads every question first, live, through a tool call** (`understanding.py`).
+One forced call of the `understand_question` tool gets the latest message, the conversation and live facts from
+the database (data coverage, apps and sub-apps, category list, vetted analyses, tables, business terms) and returns:
+the question rephrased so it stands on its own (shown as "Understood as" and in the thinking steps), its kind
+(analysis, several questions, brief, clarify, unsupported, out of scope), who "we" is, the period as dates, the
+apps, categories, splits and minimum group size, the shape asked for (one row per day, per app, per user), and the
+vetted analysis or tables that answer it. Everything below follows that reading; no keyword list or regular
+expression interprets the question on this path. Code only checks the reading against the live data (names
+must exist, dates must be real and inside the coverage) and still applies the out-of-scope safety filter. If
+OpenAI cannot be reached, the question is not answered - there is no fallback to rules. Steps 1-5 below are the
+path for the local model (Ollama).
+
+**Many questions in one message** (`parts.py`):
+- OpenAI lists every question in the message (up to 12; more are counted and reported, never dropped), each with
+  a status - answer now, needs the user's input, not in the data, outside scope - its own vetted analysis or
+  tables, and the earlier questions whose RESULT it needs.
+- Answerable questions run in waves: independent ones side by side (at most `ANALYST_PART_CONCURRENCY`, default
+  4, per request, so one long message cannot starve other users), a question that needs an earlier answer after
+  it, rewritten with that answer's actual values first. A question whose prerequisite has no answer says so.
+- The answer opens with "Your message has N questions: 3 answered, 1 needs your input, ..." and gives every
+  question its own numbered section: a direct one-sentence answer checked against its rows, the figures, and
+  OpenAI's check of both; or the reason it has no answer. A brief can be one of the questions.
+- Messages up to 12,000 characters; a longer one gets a plain sentence back, not a schema error.
+
+**Long requests, clarification and follow-ups** (same tool call, no extra request):
+- The reading also breaks the request down - main goal, individual questions, constraints, expected output -
+  shown as "Your request" under "How this was calculated". Every clear question gets its own numbered answer.
+- A long message is never by itself a reason to ask. A part is marked unclear only when an ambiguity would
+  change its answer and neither the conversation nor the defaults (whole coverage, 24-hour window, "we" = the
+  asker's company) settle it. Each unclear part gets one focused question, why it matters, and 2-4 options from
+  the user's words and the live data; the UI adds "Other - please specify". At most 3 questions.
+- Nothing answerable without a reply: ask first, run nothing. Only some parts unclear: answer the clear parts,
+  then "Still open" and the questions. A brief also asks about category names it had to leave out.
+- The questions asked are kept in the conversation state, so the reply ("For "Which campaign?": Diwali week")
+  is applied to the original request.
+- After a complete answer, 2-3 optional follow-up questions specific to the question and the answer (one short
+  OpenAI call); a suggestion with a figure the answer does not contain is dropped. None while a clarification is
+  open. The UI shows "Clarification needed" (answer required) and "Suggested follow-up questions" (optional)
+  as separate boxes.
+
 1. **Router (no model).** Scores the question against every metric (tags, titles, example questions) and pulls
    out apps (longest name first: "Amazon Now" ≠ "Amazon"; "we/our" = `ANALYST_HOME_APP`), 24/48/72 h windows,
    dates ("this week", "last 7 days", "13 Sep"), recent periods ("last 24 hours", counted back from the newest
@@ -91,8 +131,44 @@ Column policies: `ok` · `aggregate_only` (e.g. date_of_birth: usable for age gr
 6. **Deep mode accuracy**: a single simple question is answered straight from its query (no rewritten summary). Parts the
    model calls "not in the data" are re-checked against the vetted analyses before the chatbot says so, and the
    final summary is written from every result row, not a shortened list.
-7. **Deep mode** (auto for multi-part questions): split into parts, answer each, write a grounded summary, all within
+7. **Deep mode** (auto for multi-part questions): split into parts, answer and verify each, and list the parts' answers, all within
    the chosen thinking limit (60 s by default, up to 20 min); Stop returns the verified parts immediately.
+   Deep planning uses OpenAI. With Ollama, **Auto** answers a multi-part question (lines, bullets or several "?")
+   one part at a time, each as its own Fast question; choosing **Deep** explicitly still asks for OpenAI.
+   Deep parts run side by side. When time runs out, finished parts are kept, and a query the guard approved but the
+   reviewer questioned is shown flagged instead of being dropped. An OpenAI reply cut off at its output limit is
+   asked for again with more room (it used to surface as "could not be parsed" or "no valid plan").
+8. **Executive-summary briefs** (`report.py`, Auto or Deep): "I'm Flipkart's insights lead - how did we do yesterday
+   in beauty and smartphones by category, age group and gender; what went well, where did we stumble, where did
+   competitors do better; groups of at least 30 people". One model-written query for all of that was slow, got cut
+   off and failed review. A brief is answered in four steps instead:
+   - **Scope.** Who "we" is (the app the asker says they work for; kept for the rest of the chat, never changing
+     `ANALYST_HOME_APP`), the period (router dates first), the minimum group size (default 30 distinct users), the
+     breakdowns (crossed ones such as category × gender for "interlocking") and the categories. OpenAI maps the
+     asker's category words to names in `category_master`; only names that exist are used, a name with no match is
+     reported as left out (with the closest names), and city tier is reported as not recorded.
+   - **Exact queries.** The vetted `segment_scorecard` metric runs once per breakdown, all at once: users, journeys,
+     conversion, retention, leakage and purchase share per segment and app, groups under the minimum dropped.
+   - **Computed findings.** Where we lead, where a competitor converts better (a sub-app such as Flipkart Minutes is
+     never our competitor) and our own weak segments (vs the rest of our journeys), each numbered F1, F2 ... with its
+     counts ("3 of 80 journeys"). Like for like: within a category every competitor is compared; across categories
+     the benchmark is the biggest competitor, because a grocery app converts more often than a fashion app whatever
+     either does well. A gap is reported only when Fisher's exact test says it is unlikely to be chance, with the
+     false-discovery rate held at 5% across the whole brief (Benjamini-Hochberg); the rest are counted, not shown.
+     Catch-all groups (Uncategorised, Unknown, Others) never become findings.
+   - **Measures asked for.** The brief says what it measured and how: users and journeys, purchasers, conversion,
+     retention, cross-app switching as purchases made on another app. Visitors and switching to a competitor app
+     within 5 minutes come from sessions (dated by the session start in session_id, for all categories, since
+     sessions carry no category) and are shown under "Visitors and app switching".
+   - **Actions when nothing is significant.** The requested number of actions (default 3, at most 5) still comes,
+     built on the largest gaps that did not pass the test (labelled "not statistically reliable") and on data
+     caveats, under a heading that calls them tests to run, never proven findings.
+   - **Categories as paths.** A name such as "Others" recurs under several master categories, so asked categories
+     are matched as "Master > Category" paths, a shared name is tied to its sibling names' master (or left out), and
+     a journey's sub-category with more than one parent is not attributed to either.
+   - **Checked summary.** OpenAI writes went well / stumbled / competitors did better / actions. Every sentence must
+     cite findings and repeat only their numbers, apps and segments, or it is dropped. Without a model, the strongest
+     computed findings are the summary. Each breakdown's table and chart is a part under "How this was calculated".
 
 ## 3. Connect to your database
 

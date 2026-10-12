@@ -1,4 +1,5 @@
-"""Settings page: validation, secret handling, admin protection and live switching to PostgreSQL.
+"""
+Settings page: validation, secret handling, admin protection and live switching to PostgreSQL.
 
     python -m pytest tests/test_settings.py -q
 

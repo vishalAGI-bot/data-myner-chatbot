@@ -110,6 +110,10 @@ class Memory:
             "total_rows": int(table.get("total_rows") or len(table.get("rows") or [])),
             "entities": entities,
             "answered": bool(table.get("rows")),
+            # What we asked the user back, so their reply is read against it next turn.
+            "asked_back": [{"question": _clip(c.get("question"), 200),
+                            "options": [_clip(o, 60) for o in (c.get("options") or [])[:4]]}
+                           for c in (getattr(result, "clarifications", None) or [])[:3]],
         }
         self.turns = (self.turns + [turn])[-MEMORY_TURNS:]
 
@@ -141,6 +145,10 @@ class Memory:
                     lines.append(f"      ... {total} rows in total")
             elif not turn.get("answered"):
                 lines.append("    That question was not answered from the data.")
+            for asked in turn.get("asked_back") or []:
+                options = " | ".join(asked.get("options") or [])
+                lines.append(f"    We asked the user: {asked.get('question')}"
+                             + (f" (options: {options})" if options else ""))
             blocks.append("\n".join(lines))
         return "Earlier in this conversation (most recent last):\n" + "\n".join(blocks) + "\n\n"
 

@@ -42,6 +42,10 @@ export interface AnalystPart {
   sql: string | null;
   table: ResultTable | null;
   verified: boolean;
+  /** For a message with several questions: answered | flagged | no_rows | failed | clarify | unsupported |
+   *  out_of_scope | blocked | not_finished, and how it reads. */
+  status?: string;
+  label?: string;
 }
 
 export interface AnalystResponse {
@@ -63,7 +67,20 @@ export interface AnalystResponse {
   latency_ms: number;
   state: Record<string, unknown>;
   suggested_questions: string[];
+  /** Questions the user must answer before (part of) the request can be answered. */
+  clarifications?: AnalystClarification[];
+  /** Optional next questions, specific to this answer. */
+  follow_ups?: string[];
+  /** How the request was broken down: main goal, individual questions, constraints, expected output. */
+  request?: { goal?: string; parts?: string[]; constraints?: string[]; expected_output?: string };
   request_id: string;
+}
+
+export interface AnalystClarification {
+  part: number;               // the part of the request it blocks; 0 = the whole request
+  question: string;
+  why: string;                // what changes depending on the answer
+  options: string[];          // 2-4 choices; the UI adds "Other - please specify"
 }
 
 async function detail(res: Response): Promise<string> {

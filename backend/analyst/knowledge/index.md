@@ -49,6 +49,7 @@ OKF v0.2 bundle describing the `public` schema of `datamyner_db`.
 - [Journey overview](metrics/journey_overview.md)
 - [Apps in the data](metrics/app_list.md)
 - [Pipeline LLM usage](metrics/pipeline_llm_usage.md)
+- [App scorecard by segment (executive-summary briefs)](metrics/segment_scorecard.md)
 
 ## Other
 
