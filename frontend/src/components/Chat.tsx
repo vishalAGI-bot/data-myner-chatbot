@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { formatThinkTime } from "../api/journey";
 import type { JourneySuggestionGroup, ThinkingStep } from "../api/journey";
 import type { AgentInfo, Message } from "../types";
+import { plainProgress } from "../plainSteps";
+import { dayLabel, fullLabel, isSameDay } from "../when";
 import MessageBubble from "./MessageBubble";
 
 interface Props {
@@ -28,6 +30,10 @@ interface Props {
   onSend: (text: string) => void;
   onStop: () => void;
   onNewChat: () => void;
+  /** Open the chat history panel. */
+  onHistory: () => void;
+  /** The colour theme picker. */
+  themeControl?: ReactNode;
   onAsk: (q: string) => void;
   onMenu: () => void;
 }
@@ -105,7 +111,15 @@ export default function Chat(p: Props) {
           )}
         </div>
         {!p.userMode && <ModelStatus status={p.modelStatus} />}
-        <button type="button" className="new-chat" onClick={p.onNewChat} disabled={p.running}>New chat</button>
+        {p.themeControl}
+        <button type="button" className="new-chat history-btn" onClick={p.onHistory} aria-label="Chat history"
+                title="Chat history">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v2.6h2.6M8 5v3.2l2 1.3" /></svg>
+          <span>History</span>
+        </button>
+        <button type="button" className="new-chat" onClick={p.onNewChat} disabled={p.running}>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>New chat
+        </button>
       </header>
 
       <div className="messages" ref={listRef}>
@@ -153,13 +167,27 @@ export default function Chat(p: Props) {
           </div>
         )}
 
-        {p.messages.map((m) => (
-          <MessageBubble userMode={p.userMode} key={m.id} message={m} caption={p.info.caption} onAsk={p.onAsk}
-                         onDraft={(draft) => { setText(draft); requestAnimationFrame(() => inputRef.current?.focus()); }} />
-        ))}
+        {p.messages.map((m, i) => {
+          // A dated divider opens the conversation and each new day in it (a chat reopened from history
+          // and continued later shows both days).
+          const before = p.messages[i - 1]?.at;
+          const divider = m.at && (!before || !isSameDay(before, m.at));
+          return (
+            <Fragment key={m.id}>
+              {divider && (
+                <div className="day-divider" role="separator">
+                  <time dateTime={new Date(m.at!).toISOString()} title={fullLabel(m.at!)}>{dayLabel(m.at!)}</time>
+                </div>
+              )}
+              <MessageBubble userMode={p.userMode} message={m} caption={p.info.caption} onAsk={p.onAsk}
+                             onDraft={(draft) => { setText(draft); requestAnimationFrame(() => inputRef.current?.focus()); }} />
+            </Fragment>
+          );
+        })}
 
         {p.running && (
-          <ThinkingBubble steps={p.steps} elapsed={p.elapsed} maxSeconds={p.maxSeconds} onStop={p.onStop} />
+          <ThinkingBubble steps={p.steps} elapsed={p.elapsed} maxSeconds={p.maxSeconds} onStop={p.onStop}
+                          userMode={p.userMode} />
         )}
       </div>
 
@@ -178,7 +206,9 @@ export default function Chat(p: Props) {
             <span className="stop-square" />
           </button>
         ) : (
-          <button type="submit" className="send" aria-label="Send" disabled={!text.trim() || !p.canAsk}>↑</button>
+          <button type="submit" className="send" aria-label="Send" disabled={!text.trim() || !p.canAsk}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" /></svg>
+          </button>
         )}
       </form>
     </main>
@@ -204,9 +234,25 @@ function ModelStatus({ status }: { status: Props["modelStatus"] }) {
   </div>;
 }
 
-function ThinkingBubble(p: { steps: ThinkingStep[]; elapsed: number; maxSeconds: number | null; onStop: () => void }) {
+function ThinkingBubble(p: { steps: ThinkingStep[]; elapsed: number; maxSeconds: number | null; onStop: () => void;
+                             userMode?: boolean }) {
   const last = p.steps[p.steps.length - 1];
   const pct = p.maxSeconds ? Math.min(100, (p.elapsed / p.maxSeconds) * 100) : 0;
+  if (p.userMode) {
+    // /ask: the same progress in plain words - no step list (it names the model, tables and queries).
+    return (
+      <div className="row assistant">
+        <div className="bubble thinking" aria-live="polite">
+          <div className="think-row">
+            <span className="pulse" />
+            <span className="think-text">{plainProgress(last)}</span>
+            <span className="think-time">{formatThinkTime(p.elapsed)}</span>
+          </div>
+          <button type="button" className="think-stop" onClick={p.onStop}>Stop and show answer</button>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="row assistant">
       <div className="bubble thinking" aria-live="polite">

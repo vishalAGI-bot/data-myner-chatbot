@@ -24,6 +24,8 @@ export const AGENTS: Record<AgentId, AgentInfo> = {
     caption: "answered by the data analyst",
     placeholder: "Ask about purchases, leakage, apps, sessions, users, categories…",
     suggestions: [
+      "For the last 30 days: what is Flipkart's purchase share, which app converts best in Mobiles, and how many visitors did Amazon have?",
+      "I'm Amazon's insights lead: give me an executive summary of how we performed in the last 30 days by category, gender and age group, minimum 30 users per group, with three actions.",
       "What's Amazon's overall purchase share, and who is ahead of us?",
       "Of all journeys that start on Amazon, what share end up buying on Amazon vs. somewhere else?",
       "When users search on Amazon and then leave, which categories drive most of that leakage?",
@@ -54,4 +56,6 @@ export interface Message {
   journey?: JourneyResponse;
   analyst?: AnalystResponse;
   thinking?: ThinkingStep[];
+  /** When it was sent or answered (ms since 1970); App stamps every message it adds. */
+  at?: number;
 }

@@ -362,10 +362,9 @@ class Catalog:
             affected = sorted(m.name for m in self.metrics.values() if re.search(
                 r"\b(is_converted|is_retained|is_leaked|purchase_app_id|hours_to_purchase|order_amount)\b", m.sql))
             detail = (
-                f"The outcome pipeline is incomplete: {profile['purchased_journeys']:,} journeys are marked "
-                f"purchased, but 0 of {profile['journey_windows']:,} journey-window rows have linked purchase "
-                "outcomes. Purchase, conversion, leakage, order-value and time-to-purchase figures from "
-                "journey_window would be misleading until that pipeline is repaired."
+                f"Purchases are not linked yet: {profile['purchased_journeys']:,} journeys ended in a purchase, "
+                "but none of them is linked to the app, time and value of that purchase. Purchase, conversion, "
+                "leakage, order-value and time-to-purchase figures would be misleading until that is repaired."
             )
             if profile.get("checkout_confirmations", 0):
                 detail += (f" There are {profile['checkout_confirmations']:,} checkout-confirmation sessions "
@@ -380,9 +379,9 @@ class Catalog:
             issues.append({
                 "code": "partly_linked_purchase_outcomes", "severity": "warning",
                 "title": "Most purchased journeys have no linked purchase",
-                "detail": (f"{profile['purchased_journeys']:,} journeys are closed as purchased, but only "
-                           f"{profile['linked_purchase_journeys']:,} have a purchase linked in journey_window "
-                           "(app, time, value). Conversion, leakage, purchase-share and time-to-purchase figures "
+                "detail": (f"{profile['purchased_journeys']:,} journeys ended in a purchase, but only "
+                           f"{profile['linked_purchase_journeys']:,} of those purchases are linked to their app, "
+                           "time and value. Conversion, leakage, purchase-share and time-to-purchase figures "
                            "describe linked purchases only and may understate purchasing."),
                 "tables": ["cross_app_journey", "journey_window"], "affected_metrics": []})
 
@@ -400,7 +399,7 @@ class Catalog:
         if profile.get("journey_windows", 0) and profile.get("categorised_windows", 0) == 0:
             affected = sorted(m.name for m in self.metrics.values() if "category" in m.name and (
                 "search_category" in m.sql or "purchased_product_category" in m.sql))
-            detail = (f"0 of {profile['journey_windows']:,} journey-window rows have a search category, so "
+            detail = (f"None of the {profile['journey_windows']:,} journey outcomes has a search category, so "
                       "category breakdowns would collapse into ‘Uncategorised’ and are not reliable.")
             issues.append({"code": "missing_journey_categories", "severity": "warning",
                            "title": "Journey categories are empty", "detail": detail,
@@ -436,6 +435,16 @@ class Catalog:
         if _HEAVY.search(column):
             return "heavy"
         return "ok"
+
+    def subcategories_of(self, name: str) -> list[str]:
+        """Sub-categories of the category or master category ``name`` (any case). A journey stores only its
+        sub-category, so one that sits under several parents cannot be placed and is left out."""
+        key = str(name or "").strip().lower()
+        parents: dict[str, set[tuple[str, str]]] = {}
+        for master, category, sub in self.category_paths:
+            parents.setdefault(sub, set()).add((master, category))
+        return sorted(sub for sub, owners in parents.items()
+                      if len(owners) == 1 and any(key in (m.lower(), c.lower()) for m, c in owners))
 
     # ------------------------------------------------------------- queries
     @property

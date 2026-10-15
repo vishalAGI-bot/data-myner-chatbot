@@ -71,7 +71,7 @@ uncorrelated and runs once.
 
 ## Caveats
 
-Ranks by number of sessions, not by time spent; order by `total_minutes` instead if you mean duration. A user
+Ranks by number of sessions, not by time spent; ask for time spent instead if you mean duration. A user
 is counted once per session, so a long single visit ranks below several short ones.
 
 # Computation

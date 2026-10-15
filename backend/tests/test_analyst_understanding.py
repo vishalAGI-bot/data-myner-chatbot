@@ -96,7 +96,8 @@ def test_when_openai_cannot_read_the_question_there_is_no_rule_fallback():
             patch("llm.call_tool", side_effect=llm.LLMError("OpenAI request failed: APIConnectionError")):
         result = make_agent().ask("how many total user visit?", depth="auto", max_seconds=60)
     assert result.route == "error" and result.metric is None
-    assert "could not understand this question with OpenAI" in result.answer
+    assert "could not read this question just now" in result.answer and "OpenAI" not in result.answer
+    assert any("APIConnectionError" in s["text"] for s in result.thinking)
 
 
 def test_openai_intents_clarify_and_out_of_coverage():

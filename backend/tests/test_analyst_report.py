@@ -77,7 +77,9 @@ def build_snapshot(folder: Path) -> dict:
                             "window_start": start.isoformat(), "window_end": end.isoformat(),
                             "first_search_app_id": app_id, "purchase_app_id": purchase, "search_category": sub,
                             "is_converted": converted, "is_retained": retained,
-                            "is_leaked": converted and not retained, "is_final": False})
+                            "is_leaked": converted and not retained, "is_final": False,
+                            "hours_to_purchase": 2.5 if converted else None,
+                            "order_amount": 999.0 if converted else None})
 
     for u in range(1, 721):
         app_id = 4 if u > 680 else (u % 3) + 1                 # 40 users only ever use Flipkart Minutes
@@ -454,9 +456,9 @@ def test_notes_read_as_sentences():
 
 SCORECARD_COLUMNS = ["segment", "app", "users", "journeys", "converted", "conversion_pct", "retained_pct",
                      "leaked_pct", "purchases_won", "purchase_share_pct"]
-PARTLY_LINKED = ("13,469 journeys are closed as purchased, but only 1,974 have a purchase linked in journey_window "
-                 "(app, time, value). Conversion, leakage, purchase-share and time-to-purchase figures describe "
-                 "linked purchases only and may understate purchasing.")
+PARTLY_LINKED = ("13,469 journeys ended in a purchase, but only 1,974 of those purchases are linked to their app, "
+                 "time and value. Conversion, leakage, purchase-share and time-to-purchase figures describe linked "
+                 "purchases only and may understate purchasing.")
 
 
 class ThinSource:
@@ -581,3 +583,36 @@ def test_without_a_reliable_gap_the_requested_actions_are_tests_on_labelled_fact
     assert "Amazon beat us" not in result.answer, "a possible-chance gap is never shown as a competitor win"
     assert "not statistically reliable at this sample size" in result.parts[0]["answer"]
     assert "**Data caveat (F" in result.answer
+
+
+# --------------------------------------------------------------------------- a category asked by name, at any level
+
+def metric_rows(src, cat, name: str, params: dict) -> list[list]:
+    agent = AnalystAgent(src, cat, Settings(source="snapshot"), use_llm=False)
+    result = agent._run_scorecard(cat.metrics[name], params, name, keep_back=0)
+    assert result.route == "metric", result.answer
+    return result.table["rows"]
+
+
+def finished_journeys(tables: dict, subs: set[str]) -> int:
+    newest = max(w["window_start"] for w in tables["journey_window"])
+    return sum(1 for w in tables["journey_window"] if w["window_hours"] == 24 and w["search_category"] in subs
+               and w["window_end"] <= newest)
+
+
+def test_a_category_or_master_category_name_finds_its_sub_categories(duck, data):
+    """Live: "conversion in Mobiles" found no rows - journeys store the sub-category ("Smartphones"), and the
+    filter looked for the word "Mobiles" inside it."""
+    src, cat = duck
+    phones = finished_journeys(data[1], {"Android Phones", "iPhones"})      # never "Accessories": two parents
+    for asked, expected in (("Smartphones", phones), ("mobiles & tablets", phones),
+                            ("Android", finished_journeys(data[1], {"Android Phones"}))):
+        rows = metric_rows(src, cat, "conversion_by_first_app", {"window_hours": 24, "category": asked})
+        assert sum(r[1] for r in rows) == expected, asked
+
+
+def test_category_filters_are_identical_on_postgresql(duck, pg):
+    for name in ("conversion_by_first_app", "purchase_share_by_app", "leakage_destinations", "order_value_by_app",
+                 "time_to_purchase_by_app", "search_category_trend"):
+        params = {"window_hours": 24, "category": "Mobiles & Tablets"}
+        assert metric_rows(*pg, name, params) == metric_rows(*duck, name, params), name

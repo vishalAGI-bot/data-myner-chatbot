@@ -397,7 +397,8 @@ def test_a_query_the_reviewer_dislikes_still_returns_its_rows():
     agent._openai_review_sql = lambda *a, **k: ["The category_master join matches only top-level rows"]
     agent._narrate = lambda *a, **k: ("", True)
 
-    token = agent_mod._RUN.set(_Run(Budget(60)))
+    run = _Run(Budget(60))
+    token = agent_mod._RUN.set(run)
     try:
         answer = agent._free_sql("Add subcategory and master category to the table", [],
                                  ["cross_app_journey", "journey_window"],
@@ -409,7 +410,8 @@ def test_a_query_the_reviewer_dislikes_still_returns_its_rows():
     assert answer.route == "sql", f"got {answer.route}: {answer.answer[:120]}"
     assert answer.table and answer.table["rows"], "the rows were thrown away"
     assert answer.answer.startswith("**Check before relying on this.**")
-    assert "category_master join" in answer.answer, "the objection must be visible"
+    assert any("category_master join" in s.text for s in run.trace), "the objection must be visible"
+    assert "category_master" not in answer.answer, "the answer itself stays in business language (/ask)"
     assert answer.verified is False
     assert source.executed, "the query was never run"
 

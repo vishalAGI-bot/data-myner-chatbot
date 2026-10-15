@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - rapidfuzz is in requirements.txt
 
 from journey_agent import answer as grounding
 
+from .understanding import plain
+
 SCORECARD = "segment_scorecard"
 DEFAULT_MIN_USERS = 30
 MAX_BREAKDOWNS = 8
@@ -393,8 +395,8 @@ def build_scope(question: str, plan: dict | None, *, apps: list[str], home_app: 
                         + pairs)[:MAX_BREAKDOWNS]
 
     if use_rules and city_tier_requested(question):
-        scope.unavailable.append("City tier is not recorded in the data (user_master.tier is a loyalty tier), "
-                                 "so there is no city-tier breakdown.")
+        scope.unavailable.append("City tier is not recorded in the data (the recorded tier is a loyalty tier: "
+                                 "Gold, Silver or Bronze), so there is no city-tier breakdown.")
     for item in plan.get("unavailable") or []:
         text = (f"{item.get('asked')}: {item.get('reason')}" if isinstance(item, dict) else str(item)).strip()
         if _CHARTS.search(text.split(":")[0]):
@@ -767,7 +769,7 @@ actions: as many as the brief asks for (3 when it does not say, at most 5): conc
 next sale day, each citing the findings that motivate it (no numbers needed). [directional] findings are gaps
 that may be chance and [context] findings are facts about visitors, switching or the data itself: an action
 resting only on them must be worded as a test to run or a data fix, never as a proven gap.
-One sentence per bullet, at most 35 words.
+One sentence per bullet, at most 35 words, in business language: never name tables, columns, SQL or the model.
 Reply with JSON: {{"went_well": [{{"text": "...", "findings": ["F1"]}}], "stumbled": [...],
 "competitors_better": [...], "actions": [...]}}"""
 
@@ -821,7 +823,7 @@ def validated_summary(reply: dict, by_id: dict[str, Finding], apps: list[str]) -
         for item in (reply.get(kind) or [])[:5 if kind == "actions" else 4]:
             if not isinstance(item, dict):
                 continue
-            text = str(item.get("text") or "").strip()
+            text = plain(str(item.get("text") or "").strip())
             cited = [str(c).strip() for c in item.get("findings") or [] if str(c).strip()]
             if not text:
                 continue

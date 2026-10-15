@@ -47,6 +47,8 @@ Uses the 72h window by default so slower purchases are included.
 
 # Computation
 
+`category` matches a sub-category name (search_category, partly) or every sub-category of a category or master category of that name (any case): `:category_subs` is filled from category_master. A sub-category name shared by several parents is not attributed to either.
+
 `[[ ... ]]` blocks are included only when every `:parameter` inside them has a value. `{{dimension}}` is replaced from the `dimensions` allow-list above.
 
 ```sql
@@ -60,7 +62,7 @@ WHERE jw.window_hours = :window_hours AND jw.is_converted = true AND jw.hours_to
   [[ AND a.app_name = :app ]]
   [[ AND CAST(jw.window_start AS date) >= CAST(:date_from AS date) ]]
   [[ AND CAST(jw.window_start AS date) <= CAST(:date_to AS date) ]]
-  [[ AND jw.search_category ILIKE '%' || :category || '%' ]]
+  [[ AND (jw.search_category ILIKE '%' || :category || '%' OR jw.search_category IN :category_subs) ]]
 GROUP BY 1
 ORDER BY purchases DESC, 1
 ```

@@ -1,19 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import type { ResultTable } from "../api/journey";
 import { esc, fileName, savePng, saveSvg, svgDocument, type ChartImage } from "./chartExport";
+import {
+  cellText, clip, colLabel, type Exporter, fmt, fmtPeriod, fmtTick, ISO_DAY, niceTicks, type Spec,
+  usePalette, useWidth,
+} from "./chartUtils";
+import { useTheme } from "../theme";
+import Chart3D, { buildGrid } from "./Chart3D";
 
-/** Each chart kind fills this in so the download buttons do not need to know which one is drawn. */
-type Exporter = { current: (() => ChartImage | null) | null };
-
-/* Categorical slots in fixed order, validated against the white result card (dataviz palette checker:
-   adjacent CVD ΔE >= 9.1, normal-vision ΔE >= 19.6). Colour follows the entity; a 9th series never gets a
-   generated hue, it stays in the table. Three slots are below 3:1 contrast, so every chart keeps its legend
-   and the full table view right below it. */
-const SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
 const MAX_BARS = 30;
 const DEFAULT_LINES = 5;            // more lines are one legend click away (series ceiling is 8)
-const ISO_DAY = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/;
-const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 const PREFERRED = /(pct|share|rate|avg|average|mean|median|per_)/i;   // the measure a reader usually compares
 const NOT_A_MEASURE = /(^id$|_id$|^step$)/i;
 const NUMBER_LABEL = /(^|_)(hour|weekday|dow)(_|$)/i;                 // numeric, but a category (hour of day)
@@ -22,10 +18,6 @@ const NUMBER_LABEL = /(^|_)(hour|weekday|dow)(_|$)/i;                 // numeric
    them as a time series draws 14 single-point lines - a chart that looks empty and answers nothing.
    These are the span halves of the backend's period-column list (analyst/agent.py _PERIOD_COLUMNS). */
 const SPAN_COLUMN = /^(period_start|period_end|first_day|last_day|week_end|month_end|start_date|end_date)$/i;
-
-type Spec =
-  | { kind: "line"; period: number; groups: number[]; measures: number[] }
-  | { kind: "bar"; labels: number[]; measures: number[] };
 
 /** The chart a result supports: one line per group over a date column, else bars per category; null = none. */
 export function chartSpec(table: ResultTable): Spec | null {
@@ -74,7 +66,12 @@ export default function ResultChart({ table }: { table: ResultTable }) {
     ? ranked ?? spec.measures.find((i) => PREFERRED.test(table.columns[i])) ?? spec.measures[0]
     : -1;
   const [measure, setMeasure] = useState(preferred);
+  const [view, setView] = useState<"2d" | "3d">("2d");
+  const palette = usePalette();
+  const grid = useMemo(() => (spec ? buildGrid(table, spec, measure, preferred, palette) : null),
+                       [table, spec, measure, preferred, palette]);
   if (!spec) return null;
+  const in3d = view === "3d" && grid !== null;
   const columns = table.columns;
   const groups = spec.kind === "line" && spec.groups.length
     ? new Set(table.rows.map((r) => spec.groups.map((g) => cellText(r[g])).join(" · "))) : new Set<string>();
@@ -82,16 +79,17 @@ export default function ResultChart({ table }: { table: ResultTable }) {
   // The saved image has to stand on its own, so it carries the same title the card shows and says
   // when it is not the whole result.
   const heading = colLabel(columns[measure]);
-  const title = `${heading.charAt(0).toUpperCase()}${heading.slice(1)} by ${by}`;
+  const title = in3d ? `${grid.title.charAt(0).toUpperCase()}${grid.title.slice(1)} (3D view)`
+    : `${heading.charAt(0).toUpperCase()}${heading.slice(1)} by ${by}`;
   const caption = table.truncated
     ? "The query hit the row limit; the chart shows the returned rows only."
     : spec.kind === "bar" && table.rows.length > MAX_BARS
       ? `First ${MAX_BARS} of ${table.rows.length} rows, in the table's order.` : "";
-  const name = fileName([colLabel(columns[measure]), "by", by]);
+  const name = fileName(in3d ? [grid.title, "3d"] : [colLabel(columns[measure]), "by", by]);
   return (
     <figure className="result-chart">
       <div className="chart-head">
-        {spec.measures.length > 1 ? (
+        {in3d && grid.scaled ? <span className="chart-measure">All measures</span> : spec.measures.length > 1 ? (
           <label>
             <span className="visually-hidden">Measure </span>
             <select value={measure} onChange={(e) => setMeasure(Number(e.target.value))}>
@@ -99,17 +97,25 @@ export default function ResultChart({ table }: { table: ResultTable }) {
             </select>
           </label>
         ) : <span className="chart-measure">{colLabel(columns[measure])}</span>}
-        <span>by {by}{groups.size === 1 ? ` · ${[...groups][0]}` : ""}</span>
+        <span>{in3d ? `by ${grid.xTitle} and ${grid.zTitle}` : `by ${by}${groups.size === 1 ? ` · ${[...groups][0]}` : ""}`}</span>
         <span className="chart-actions">
+          {grid && (
+            <span className="view-toggle" role="group" aria-label="Chart view">
+              <button type="button" aria-pressed={!in3d} onClick={() => setView("2d")}>2D</button>
+              <button type="button" aria-pressed={in3d} onClick={() => setView("3d")}
+                title="A 3D view with two dimensions on the floor">3D</button>
+            </span>
+          )}
           <DownloadButton format="png" title={title} caption={caption} name={name}
                           exporter={exporter} onError={setFailed} />
           <DownloadButton format="svg" title={title} caption={caption} name={name}
                           exporter={exporter} onError={setFailed} />
         </span>
       </div>
-      {spec.kind === "line"
-        ? <LineChart table={table} spec={spec} measure={measure} rankBy={preferred} exporter={exporter} />
-        : <BarChart table={table} spec={spec} measure={measure} exporter={exporter} />}
+      {in3d ? <Chart3D grid={grid} exporter={exporter} />
+        : spec.kind === "line"
+          ? <LineChart table={table} spec={spec} measure={measure} rankBy={preferred} exporter={exporter} />
+          : <BarChart table={table} spec={spec} measure={measure} exporter={exporter} />}
       {failed && <figcaption className="chart-note warn-note">{failed}</figcaption>}
       {table.truncated && (
         <figcaption className="chart-note">The query hit the row limit; the chart shows the returned rows only.</figcaption>
@@ -123,10 +129,11 @@ function DownloadButton({ format, title, caption, name, exporter, onError }: {
   exporter: Exporter; onError: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const theme = useTheme();
   const save = async () => {
     const image = exporter.current?.();
     if (!image) return onError("The chart is not ready to download yet. Try again in a moment.");
-    const svg = svgDocument(image, title, caption);
+    const svg = svgDocument(image, title, caption, theme);       // the image matches what is on screen
     setBusy(true);
     onError("");
     try {
@@ -158,6 +165,7 @@ function LineChart({ table, spec, measure, rankBy, exporter }:
   const { columns, rows } = table;
   const col = columns[measure];
   const periodCol = columns[spec.period];
+  const palette = usePalette();
   const periods = useMemo(() => [...new Set(rows.map((r) => String(r[spec.period])))].sort(), [rows, spec.period]);
 
   // Series are ranked once, by the default measure, so switching the measure never repaints an app.
@@ -174,8 +182,8 @@ function LineChart({ table, spec, measure, rankBy, exporter }:
       if (typeof w === "number") s.weight += Math.abs(w);
     }
     const ranked = [...byName.values()].sort((a, b) => b.weight - a.weight);
-    return { series: ranked.slice(0, SERIES.length).map((s, i) => ({ ...s, color: SERIES[i] })), total: ranked.length };
-  }, [rows, spec, periods, measure, rankBy, col]);
+    return { series: ranked.slice(0, palette.length).map((s, i) => ({ ...s, color: palette[i] })), total: ranked.length };
+  }, [rows, spec, periods, measure, rankBy, col, palette]);
 
   const [off, setOff] = useState<Set<string>>(() => new Set(series.slice(DEFAULT_LINES).map((s) => s.name)));
   const [hover, setHover] = useState<number | null>(null);
@@ -276,7 +284,7 @@ function LineChart({ table, spec, measure, rankBy, exporter }:
               <path d={linePath(s.values, x, y)} fill="none" stroke={s.color} strokeWidth={2}
                 strokeLinejoin="round" strokeLinecap="round" />
               {dots && s.values.map((v, i) => v !== null && (
-                <circle key={i} cx={x(i)} cy={y(v)} r={4} fill={s.color} stroke="#fff" strokeWidth={2} />
+                <circle key={i} className="chart-ring" cx={x(i)} cy={y(v)} r={4} fill={s.color} strokeWidth={2} />
               ))}
             </g>
           ))}
@@ -287,7 +295,8 @@ function LineChart({ table, spec, measure, rankBy, exporter }:
             <g pointerEvents="none" data-ui="hover">
               <line className="chart-cross" x1={hx} x2={hx} y1={top} y2={top + plotH} />
               {visible.map((s) => s.values[hover] !== null && (
-                <circle key={s.name} cx={hx} cy={y(s.values[hover]!)} r={4.5} fill={s.color} stroke="#fff" strokeWidth={2} />
+                <circle key={s.name} className="chart-ring" cx={hx} cy={y(s.values[hover]!)} r={4.5} fill={s.color}
+                  strokeWidth={2} />
               ))}
             </g>
           )}
@@ -346,6 +355,7 @@ function BarChart({ table, spec, measure, exporter }:
   { table: ResultTable; spec: Extract<Spec, { kind: "bar" }>; measure: number; exporter: Exporter }) {
   const { columns } = table;
   const col = columns[measure];
+  const palette = usePalette();
   const rows = table.rows.slice(0, MAX_BARS);
   const [hover, setHover] = useState<number | null>(null);
   const values = rows.map((r) => (typeof r[measure] === "number" ? (r[measure] as number) : null));
@@ -374,14 +384,14 @@ function BarChart({ table, spec, measure, exporter }:
         const y = i * rowH;
         return `<text class="x-label" x="0" y="${y + 17}">${esc(clip(names[i], labelW))}</text>`
           + `<rect x="${x0.toFixed(1)}" y="${y + 6}" width="${Math.max(w, v === null ? 0 : 1).toFixed(1)}" `
-          + `height="16" rx="3" fill="${SERIES[0]}"/>`
+          + `height="16" rx="3" fill="${palette[0]}"/>`
           + `<text class="x-value" x="${(negative ? x0 - 6 : x0 + w + 6).toFixed(1)}" y="${y + 18}"`
           + `${negative ? ' text-anchor="end"' : ""}>${esc(fmt(col, v))}</text>`;
       }).join("");
       return { body, width, height: rows.length * rowH + 6 };
     };
     return () => { exporter.current = null; };
-  }, [exporter, rows, values, names, span, zero, width, col]);
+  }, [exporter, rows, values, names, span, zero, width, col, palette]);
 
   return (
     <>
@@ -400,7 +410,7 @@ function BarChart({ table, spec, measure, exporter }:
               <span className="bar-label" title={name}>{name}</span>
               <span className="bar-track">
                 <span className={`bar${negative ? " neg" : ""}`}
-                  style={{ left: `${start}%`, width: `${w}%`, background: SERIES[0] }} />
+                  style={{ left: `${start}%`, width: `${w}%`, background: palette[0] }} />
                 <span className="bar-value" style={negative
                   ? { right: `calc(${100 - start}% + 6px)` } : { left: `calc(${start + w}% + 6px)` }}>{fmt(col, v)}</span>
               </span>
@@ -425,32 +435,6 @@ function BarChart({ table, spec, measure, exporter }:
 
 // ----------------------------------------------------------------------- utils
 
-function useWidth<T extends HTMLElement>() {
-  const ref = useRef<T>(null);
-  const [width, setWidth] = useState(640);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const observer = new ResizeObserver(([entry]) => setWidth(Math.max(240, Math.floor(entry.contentRect.width))));
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, width] as const;
-}
-
-/** Round axis ticks (0 / 5 / 10 ...) covering [min, max]. */
-function niceTicks(min: number, max: number, count = 4): number[] {
-  const span = max - min || 1;
-  const magnitude = 10 ** Math.floor(Math.log10(span / count));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => span / s <= count) ?? 10 * magnitude;
-  const ticks: number[] = [];
-  for (let v = Math.floor(min / step) * step; ; v += step) {
-    ticks.push(Number(v.toPrecision(12)));
-    if (v >= max - step * 1e-9) break;
-  }
-  return ticks;
-}
-
 /** One row of swatches for the exported line chart; the on-screen legend is HTML, not SVG. */
 function legendSvg(series: Series[], width: number): string {
   let x = 0;
@@ -463,12 +447,6 @@ function legendSvg(series: Series[], width: number): string {
     x += w;
   }
   return `<g transform="translate(0,${250 + 18})">${parts.join("")}</g>`;
-}
-
-/** Trim a label to the pixels it is given, since SVG text does not clip itself. */
-function clip(text: string, pixels: number): string {
-  const max = Math.max(4, Math.floor(pixels / 6.2));
-  return text.length > max ? `${text.slice(0, max - 1)}\u2026` : text;
 }
 
 /** Whether every row moves the same way on this column, i.e. the table is ordered by it. */
@@ -493,38 +471,4 @@ function linePath(values: (number | null)[], x: (i: number) => number, y: (v: nu
 function lastIndex(values: (number | null)[]): number {
   for (let i = values.length - 1; i >= 0; i--) if (values[i] !== null) return i;
   return -1;
-}
-
-const isPct = (col: string) => /(^|_)pct($|_)|percent/i.test(col);
-
-function colLabel(col: string): string {
-  return col.replace(/_pct$/i, " %").replace(/_/g, " ");
-}
-
-function cellText(v: unknown): string {
-  if (v === null || v === undefined || v === "") return "Unknown";
-  if (typeof v === "boolean") return v ? "yes" : "no";
-  return Array.isArray(v) ? v.join(", ") : String(v);
-}
-
-function fmt(col: string, v: unknown): string {
-  if (typeof v !== "number") return v === null || v === undefined ? "–" : String(v);
-  const text = v.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v) < 10 ? 2 : 1 });
-  return isPct(col) ? `${text}%` : text;
-}
-
-function fmtTick(col: string, v: number): string {
-  const text = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(v);
-  return isPct(col) ? `${text}%` : text;
-}
-
-/** "2026-09-07" -> "Sep 7" (string parsing, so no time-zone shift); long form names the week or month. */
-function fmtPeriod(value: string, col = "", long = false): string {
-  const m = ISO_DAY.exec(value);
-  if (!m) return value;
-  const time = m[4] && `${m[4]}:${m[5]}` !== "00:00" ? ` ${m[4]}:${m[5]}` : "";
-  if (long && /^month/i.test(col)) return `${MONTHS[Number(m[2]) - 1]} ${m[1]}`;
-  const day = `${MONTHS[Number(m[2]) - 1]} ${Number(m[3])}${time}`;
-  if (!long) return day;
-  return /^week/i.test(col) ? `Week of ${day}, ${m[1]}` : `${day}, ${m[1]}`;
 }

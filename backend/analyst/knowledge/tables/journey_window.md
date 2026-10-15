@@ -51,7 +51,7 @@ one row per journey x window_hours (24, 48, 72)
 
 ## Notes
 
-ALWAYS filter window_hours (default 24) - otherwise every journey is counted three times. For rates count only finished windows: jw.window_end <= (SELECT MAX(lw.window_start) FROM journey_window lw), i.e. the window ended before the newest loaded journey. Do NOT use is_final: the pipeline computes rows a few hours after the window starts and never sets is_final once the window ends (most finished windows are false). is_retained = bought on the first-search app; is_leaked = bought on a different app (inferred from field names - confirm with the data team). apps_searched and purchased_product_* are arrays.
+ALWAYS filter window_hours (default 24) - otherwise every journey is counted three times. For rates count only finished windows: jw.window_end <= (SELECT MAX(lw.window_start) FROM journey_window lw), i.e. the window ended before the newest loaded journey. Do NOT use is_final: the pipeline computes rows a few hours after the window starts and never sets is_final once the window ends (most finished windows are false). is_retained = bought on the first-search app; is_leaked = bought on a different app (inferred from field names - confirm with the data team). apps_searched and purchased_product_* are arrays. search_category holds the sub-category (third level of category_master): to filter or group by a category or master category, map it through category_master.sub_category, never by matching the category name against search_category.
 
 ## Example questions
 

@@ -32,7 +32,7 @@ Directional share of app sessions where an order-confirmation screen was detecte
 
 ## Caveats
 
-This is not verified order or market-share data. A screen detector can miss an order or count repeated confirmation screens, so use it only as a directional signal until purchase outcomes are linked into `journey_window`.
+This is not verified order or market-share data. A screen detector can miss an order or count repeated confirmation screens, so use it only as a directional signal until purchases are linked to journeys.
 
 # Computation
 

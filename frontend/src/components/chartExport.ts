@@ -5,7 +5,12 @@
  * saved by serializing the DOM alone. Building the document means one code path for both chart
  * kinds, and an image that carries its own title and legend instead of depending on the page
  * around it. PNG is the same document rasterized through a canvas - no extra dependency.
+ *
+ * The image follows the theme on screen: its series colours are the ones the reader is looking at, and
+ * those are stepped for that theme's card, so a dark chart is saved on its dark card rather than on white.
  */
+
+import type { Theme } from "../theme";
 
 export interface ChartImage {
   /** Plot contents, already positioned inside a `width` x `height` box. */
@@ -26,24 +31,32 @@ export function esc(text: string): string {
 const TITLE_H = 34;
 const PAD = 14;
 
+/* The chart chrome of each theme: the same roles as the page's chart tokens (styles.css --chart-*). */
+const CHROME: Record<Theme, { bg: string; grid: string; base: string; muted: string; ink: string }> = {
+  light: { bg: "#ffffff", grid: "#e9ece9", base: "#c6cec8", muted: "#6d7b74", ink: "#1d2823" },
+  dark: { bg: "#16211c", grid: "#26352e", base: "#3d5148", muted: "#94a89e", ink: "#e6efe9" },
+};
+
 /** Wrap plot contents in a standalone, self-styled SVG document with a title and optional caption. */
-export function svgDocument(image: ChartImage, title: string, caption: string): string {
+export function svgDocument(image: ChartImage, title: string, caption: string, theme: Theme = "light"): string {
+  const c = CHROME[theme];
   const width = image.width + PAD * 2;
   const height = image.height + TITLE_H + PAD + (caption ? 18 : 0);
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" `
       + `viewBox="0 0 ${width} ${height}" font-family="${EXPORT_FONT}">`,
     `<style>`,
-    `.chart-grid{stroke:#e9ece9;stroke-width:1}`,
-    `.chart-base{stroke:#c6cec8;stroke-width:1}`,
-    `.chart-axis{fill:#6d7b74;font-size:10.5px}`,
-    `.chart-end{fill:#1d2823;font-size:11px;font-weight:600}`,
-    `.x-title{fill:#1d2823;font-size:13px;font-weight:600}`,
-    `.x-note{fill:#6d7b74;font-size:10.5px}`,
-    `.x-label{fill:#1d2823;font-size:11.5px}`,
-    `.x-value{fill:#1d2823;font-size:11px}`,
+    `.chart-grid{stroke:${c.grid};stroke-width:1}`,
+    `.chart-base{stroke:${c.base};stroke-width:1}`,
+    `.chart-ring{stroke:${c.bg}}`,
+    `.chart-axis{fill:${c.muted};font-size:10.5px}`,
+    `.chart-end{fill:${c.ink};font-size:11px;font-weight:600}`,
+    `.x-title{fill:${c.ink};font-size:13px;font-weight:600}`,
+    `.x-note{fill:${c.muted};font-size:10.5px}`,
+    `.x-label{fill:${c.ink};font-size:11.5px}`,
+    `.x-value{fill:${c.ink};font-size:11px}`,
     `</style>`,
-    `<rect width="${width}" height="${height}" fill="#ffffff"/>`,
+    `<rect width="${width}" height="${height}" fill="${c.bg}"/>`,
     `<text class="x-title" x="${PAD}" y="21">${esc(title)}</text>`,
     `<g transform="translate(${PAD},${TITLE_H})">${image.body}</g>`,
     caption ? `<text class="x-note" x="${PAD}" y="${height - 7}">${esc(caption)}</text>` : "",

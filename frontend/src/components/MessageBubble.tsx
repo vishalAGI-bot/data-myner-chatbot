@@ -4,7 +4,14 @@ import remarkGfm from "remark-gfm";
 import type { AnalystClarification, AnalystResponse } from "../api/analyst";
 import type { ResultTable, ThinkingStep } from "../api/journey";
 import type { Message } from "../types";
+import { plainSummary } from "../plainSteps";
+import { fullLabel, isoLabel, timeLabel } from "../when";
 import ResultChart, { chartSpec } from "./ResultChart";
+
+/** When a message was sent or answered; the full date and time on hover (the day is on the divider above). */
+function MessageTime({ at }: { at: number }) {
+  return <time className="msg-time" dateTime={isoLabel(at)} title={fullLabel(at)}>{timeLabel(at)}</time>;
+}
 
 export default function MessageBubble({ message, caption, onAsk, onDraft, userMode = false }:
   { message: Message; caption: string; onAsk: (question: string) => void;
@@ -15,6 +22,7 @@ export default function MessageBubble({ message, caption, onAsk, onDraft, userMo
     return (
       <div className="row user">
         <div className="bubble user-bubble"><AnswerText text={message.content} /></div>
+        {message.at && <MessageTime at={message.at} />}
       </div>
     );
   }
@@ -87,6 +95,7 @@ export default function MessageBubble({ message, caption, onAsk, onDraft, userMo
         </div>
       )}
       <div className="caption">
+        {message.at && <><MessageTime at={message.at} /><span aria-hidden="true">·</span></>}
         {message.error ? "the request did not complete" : userMode ? "answered from your data" : caption}
         {bits.length > 0 && <span> · {bits.join(" · ")}</span>}
         {hasDetails && (
@@ -108,12 +117,14 @@ export default function MessageBubble({ message, caption, onAsk, onDraft, userMo
           <Field label="Understood as">{a.resolved || "your question"}</Field>
           <RequestField request={a.request} />
           {scope.length > 0 && <Field label="Applied to">{scope.join(" · ")}</Field>}
+          <PlainSteps lines={plainSummary(a.thinking ?? [], a.timed_out)} />
           {a.parts.length > 0 && (
             <Field label={`Answered in ${a.parts.length} parts`}>
               <ol className="parts part-cards">
                 {a.parts.map((part, i) => (
                   <li key={i} className={part.verified ? "supported" : "unsupported"}>
                     <strong>{part.question}</strong>
+                    {part.label && <span className="part-status">{part.label}</span>}
                     {part.answer && <div className="part-answer"><AnswerText text={part.answer} /></div>}
                     {part.table && <TableField table={part.table} compact />}
                   </li>
@@ -184,6 +195,8 @@ function TableField({ table, compact = false, inline = false }:
   { table: ResultTable; compact?: boolean; inline?: boolean }) {
   const [chart, setChart] = useState(false);
   const canChart = useMemo(() => chartSpec(table) !== null, [table]);
+  // A number column's heading sits over its right-aligned numbers.
+  const numeric = useMemo(() => table.columns.map((_, k) => table.rows.some((r) => typeof r[k] === "number")), [table]);
   const label = `Result table (${table.total_rows.toLocaleString()}${table.truncated ? "+" : ""} rows)`;
   const vizButton = canChart && (
     <button type="button" className="viz-btn" aria-expanded={chart} onClick={() => setChart(!chart)}>
@@ -196,7 +209,9 @@ function TableField({ table, compact = false, inline = false }:
       {chart && <ResultChart table={table} />}
       {table.rows.length === 0 ? <div className="empty-result">The query ran successfully, but no rows matched.</div> : <div className="table-wrap">
         <table>
-          <thead><tr>{table.columns.map((c) => <th key={c}>{c.replace(/_/g, " ")}</th>)}</tr></thead>
+          <thead><tr>{table.columns.map((c, k) => (
+            <th key={c} className={numeric[k] ? "num" : ""}>{c.replace(/_/g, " ")}</th>
+          ))}</tr></thead>
           <tbody>
             {table.rows.slice(0, 200).map((r, i) => (
               <tr key={i}>{r.map((v, k) => (
@@ -376,6 +391,16 @@ function Clarifications({ items, onAsk, onDraft }:
         </div>
       ))}
     </section>
+  );
+}
+
+/** What was done, in plain words: the /ask counterpart of the working page's thinking steps. */
+function PlainSteps({ lines }: { lines: string[] }) {
+  if (!lines.length) return null;
+  return (
+    <Field label="How this was answered">
+      <ol className="request-parts">{lines.map((line) => <li key={line}>{line}</li>)}</ol>
+    </Field>
   );
 }
 

@@ -52,9 +52,11 @@ For journeys that START on each app: share that converted, share bought on that 
 
 ## Caveats
 
-Only finished windows are counted (window_end at or before the newest loaded journey) so rates are not diluted by journeys still in progress. The is_final flag is not used: the pipeline does not update it after a window ends.
+Only journeys whose purchase window has ended are counted, so rates are not diluted by journeys still in progress.
 
 # Computation
+
+`category` matches a sub-category name (search_category, partly) or every sub-category of a category or master category of that name (any case): `:category_subs` is filled from category_master. A sub-category name shared by several parents is not attributed to either.
 
 `[[ ... ]]` blocks are included only when every `:parameter` inside them has a value. `{{dimension}}` is replaced from the `dimensions` allow-list above.
 
@@ -75,7 +77,7 @@ WHERE jw.window_hours = :window_hours AND jw.window_end <= (SELECT MAX(lw.window
   [[ AND a.app_name = :app ]]
   [[ AND CAST(jw.window_start AS date) >= CAST(:date_from AS date) ]]
   [[ AND CAST(jw.window_start AS date) <= CAST(:date_to AS date) ]]
-  [[ AND jw.search_category ILIKE '%' || :category || '%' ]]
+  [[ AND (jw.search_category ILIKE '%' || :category || '%' OR jw.search_category IN :category_subs) ]]
 GROUP BY 1
 ORDER BY journeys DESC, 1
 ```

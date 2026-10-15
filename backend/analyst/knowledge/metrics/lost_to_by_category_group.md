@@ -41,7 +41,7 @@ Leaked purchases from an app, split by the master category of the search and the
 
 ## Caveats
 
-search_category is matched to category_master.sub_category; unmatched categories show as Uncategorised.
+Each journey's category is matched to the category list; categories not in the list show as Uncategorised.
 
 # Computation
 

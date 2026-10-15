@@ -28,6 +28,22 @@ PART_STATUSES = ("answer", "clarify", "unsupported", "out_of_scope")
 MEASURES = ("visitors", "purchasers", "conversion", "retention", "cross_app_switching", "purchase_share",
             "order_value", "time_to_purchase")
 MAX_CLARIFICATIONS = 3
+# Words a user reads must not be schema names (the /ask page promise). The prompt asks for business language;
+# this is the second layer for what OpenAI writes anyway.
+_TABLE_WORDS = {"user_master": "user", "journey_window": "journey", "session_master": "session", "app_master": "app",
+                "category_master": "category list", "cross_app_journey": "journey", "cross_app_journey_event": "search",
+                "product_master": "product", "sub_session_master": "sub-app session",
+                "testing_accessibility_infos": "screen event", "llm_call_log": "pipeline log"}
+_QUALIFIED = re.compile(r"\b[a-z]+(?:_[a-z]+)+\.([a-z]+(?:_[a-z]+)*)\b")
+_SNAKE = re.compile(r"\b[a-z]+(?:_[a-z]+)+\b")
+
+
+def plain(text: str) -> str:
+    """"user_master.tier" -> "tier", "journey_window" -> "journey", "first_search_time" -> "first search time"."""
+    text = _QUALIFIED.sub(lambda m: m.group(1).replace("_", " "), str(text or ""))
+    return _SNAKE.sub(lambda m: _TABLE_WORDS.get(m.group(0), m.group(0).replace("_", " ")), text)
+
+
 _OTHER = re.compile(r"^\s*(other|others|something else|none of (these|the above))\b", re.I)    # the UI adds "Other"
 
 TOOL_NAME = "understand_question"
@@ -160,6 +176,9 @@ analyse or compute anything.
   unavailable. City tier is not recorded; user_master.tier is a loyalty tier.
 - Every result is a table the user can show as a chart, so graphs and charts are always available: never list
   them as unavailable.
+- Write everything the user may read - rephrased_question, message, reasons, clarification questions, why and
+  options - in plain business language. Never name tables, columns, SQL, the model or the provider (say "the
+  loyalty tier", not "user_master.tier").
 
 Apps: {apps}
 Sub-apps (part of their main app, never its competitor): {sub_apps}
@@ -295,8 +314,8 @@ def _part(number: int, raw, *, metrics: dict, tables: set[str], dropped: list[st
         metric = ""
     grain = str(raw.get("time_grain") or "").lower()
     return Part(
-        number=number, question=str(raw.get("question")).strip()[:500], status=status,
-        reason=str(raw.get("reason") or "").strip()[:300],
+        number=number, question=plain(str(raw.get("question")).strip()[:500]), status=status,
+        reason=plain(str(raw.get("reason") or "").strip()[:300]),
         depends_on=sorted({d for d in raw.get("depends_on") or [] if isinstance(d, int) and 1 <= d < number}),
         kind="brief" if raw.get("kind") == "brief" else "analysis", metric=metric or None,
         metric_params=raw.get("metric_params") if isinstance(raw.get("metric_params"), dict) else {},
@@ -319,9 +338,9 @@ def parse(args: dict, *, apps: list[str], metrics: dict, tables: set[str], date_
 
     intent = str(args.get("intent") or "").strip().lower()
     u = Understanding(
-        question=str(args.get("rephrased_question") or "").strip()[:1000] or fallback_question,
+        question=plain(str(args.get("rephrased_question") or "").strip()[:1000]) or fallback_question,
         intent=intent if intent in INTENTS else "analysis",
-        message=str(args.get("message") or "").strip()[:600],
+        message=plain(str(args.get("message") or "").strip()[:600]),
         focus_app=app(args.get("focus_app")),
         apps=[a for a in dict.fromkeys(app(n) for n in args.get("apps") or [] if str(n).strip()) if a],
         date_from=_iso(args.get("date_from")), date_to=_iso(args.get("date_to")),
@@ -334,7 +353,8 @@ def parse(args: dict, *, apps: list[str], metrics: dict, tables: set[str], date_
         breakdowns=[str(b) for b in args.get("breakdowns") or []],
         min_users=args.get("min_users") if isinstance(args.get("min_users"), int) and args["min_users"] > 0 else None,
         measures=[m for m in dict.fromkeys(str(x) for x in args.get("measures") or []) if m in MEASURES],
-        unavailable=list(args.get("unavailable") or []),
+        unavailable=[{k: plain(v) for k, v in x.items()} if isinstance(x, dict) else plain(x)
+                     for x in args.get("unavailable") or []],
         metric_params=args.get("metric_params") if isinstance(args.get("metric_params"), dict) else {})
     metric =str(args.get("metric") or "").strip()
     if metric and metric in metrics and metrics[metric].available:
@@ -346,9 +366,9 @@ def parse(args: dict, *, apps: list[str], metrics: dict, tables: set[str], date_
     first, last = (str(d)[:10] if d else None for d in date_range)
     if first and last and ((u.date_from and u.date_from < first) or (u.date_to and u.date_to > last)):
         u.outside_coverage = True
-    u.goal = str(args.get("goal") or "").strip()[:300]
-    u.constraints = [str(c).strip()[:200] for c in args.get("constraints") or [] if str(c).strip()][:8]
-    u.expected_output = str(args.get("expected_output") or "").strip()[:200]
+    u.goal = plain(str(args.get("goal") or "").strip()[:300])
+    u.constraints = [plain(str(c).strip()[:200]) for c in args.get("constraints") or [] if str(c).strip()][:8]
+    u.expected_output = plain(str(args.get("expected_output") or "").strip()[:200])
     listed = [x for x in args.get("parts") or []
               if str(x.get("question") if isinstance(x, dict) else x or "").strip()]
     for raw in listed[:MAX_PARTS]:
@@ -358,12 +378,13 @@ def parse(args: dict, *, apps: list[str], metrics: dict, tables: set[str], date_
     for item in args.get("clarifications") or []:
         if not isinstance(item, dict) or not str(item.get("question") or "").strip():
             continue
-        options = [o for o in dict.fromkeys(str(x).strip()[:120] for x in item.get("options") or [])
+        options = [o for o in dict.fromkeys(plain(str(x).strip()[:120]) for x in item.get("options") or [])
                    if o and not _OTHER.match(o)][:4]
         number = item.get("part") if isinstance(item.get("part"), int) else 0
         u.clarifications.append({
             "part": number if 0 <= number <= len(u.parts) else 0,
-            "question": str(item["question"]).strip()[:300], "why": str(item.get("why") or "").strip()[:300],
+            "question": plain(str(item["question"]).strip()[:300]),
+            "why": plain(str(item.get("why") or "").strip()[:300]),
             "options": options})
     u.clarifications = u.clarifications[:MAX_CLARIFICATIONS]
     if u.intent == "clarify" and not u.clarifications:

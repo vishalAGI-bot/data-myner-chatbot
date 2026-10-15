@@ -162,6 +162,9 @@ Rules:
 - journey_window: always filter window_hours (default {window}). For rates count finished windows only:
   jw.window_end <= (SELECT MAX(lw.window_start) FROM journey_window lw). Never use is_final (stale flag).
 - Join app_master to show app names instead of ids. "we/us/our" = {home_app}.
+- journey_window.search_category is the sub-category (third level). For a category or master category, select
+  the sub-categories through category_master (sub_category -> category, master_category); a category name never
+  appears inside search_category.
 - Never invent a mapping between an identifier in the question and a column that does not exist. Apps have
   no code or site number: match them on app_master.app_name or app_master.id, and always return app_name so
   the answer shows which app was actually used.
@@ -373,7 +376,8 @@ Make them specific to the question and the answer below - a natural next step su
 with a named competitor, a longer period, or the reason behind a gap the answer shows - not generic ideas, and
 never a repeat of what was already answered. Each must be answerable from this data: apps {apps}; data from
 {first_day} to {last_day}; analyses such as {analyses}. Do not state or imply any figure the answer does not
-contain, and do not invent apps or categories. One short question each, at most 20 words.
+contain, and do not invent apps or categories. One short question each, at most 20 words, in business language
+(never table or column names, SQL or the model).
 Reply with JSON: {{"questions": ["...", "..."]}}"""
 
 COMPARE_SYSTEM = """Answer a comparison question about shopping-app data for a business reader in 2 to 4 sentences.
@@ -803,30 +807,32 @@ class AnalystAgent:
                     result.suggested_questions = result.suggested_questions or self._available_questions()
                 if style == "simple" and result.route in ("metric", "sql", "deep"):
                     result = self._simplify(result)
+        # What the user reads never names the model, the provider, tables or SQL (the /ask page promises
+        # that); the technical reason goes to the thinking steps, which only the working page shows.
         except _UnderstandError as exc:
             self._emit("understand", f"OpenAI could not read the question: {exc}", ok=False)
-            result = AnalystAnswer(
-                f"I could not understand this question with OpenAI ({exc}). Please try again in a moment.",
-                route="error", source="llm", resolved=question, verified=False)
+            result = AnalystAnswer("I could not read this question just now. Please try again in a moment.",
+                                   route="error", source="llm", resolved=question, verified=False)
         except _PlanError as exc:
             self._emit("verify", f"OpenAI's Deep-analysis plan could not be used: {exc}", ok=False)
             result = AnalystAnswer(
-                f"OpenAI could not produce a usable Deep-analysis plan for this question ({exc}). Try asking the "
-                "parts one at a time, or name the metrics, apps and dates you need.", route="error",
+                "I could not work out how to answer this question. Try asking the parts one at a time, or name "
+                "the measures, apps and dates you need.", route="error",
                 source="llm", resolved=question, depth="deep", verified=False)
         except (ValueError, json.JSONDecodeError) as exc:
             log.exception("unreadable model reply")
             self._emit("verify", f"A model reply could not be read: {exc}", ok=False)
-            result = AnalystAnswer(
-                "The language model returned a reply that could not be read, so this question was not "
-                "answered. Please try again.", route="error", source="llm", resolved=question, verified=False)
+            result = AnalystAnswer("Something went wrong while preparing the answer, so this question was not "
+                                   "answered. Please try again.", route="error", source="llm", resolved=question,
+                                   verified=False)
         except ThinkingTimeout as exc:
             self._emit("stop", f"Stopped: {exc}", ok=False)
             result = AnalystAnswer(f"I stopped because {exc} before I had a verified answer.",
                                    route="timeout", timed_out=True)
         except llm.OllamaError as exc:
-            result = AnalystAnswer("This question needs the language model, which is not reachable "
-                                   f"({exc}). Try one of the built-in analyses (see Try asking).",
+            self._emit("stop", f"The language model is not reachable: {exc}", ok=False)
+            result = AnalystAnswer("This question can't be answered right now: the service that reads questions "
+                                   "is not reachable. Try one of the built-in analyses (see Try asking).",
                                    route="error")
         finally:
             for t in (home_token, run.home_token):
@@ -947,7 +953,7 @@ class AnalystAgent:
         evidence = [result.answer, result.resolved, "1 7 14 24 30 48 72"]
         out = []
         for q in questions[:4]:
-            q = str(q).strip()
+            q = understanding_lib.plain(str(q).strip())
             if (q and len(q) <= 200 and q.lower() != result.resolved.lower()
                     and not grounding.ungrounded_numbers(q, evidence)):
                 out.append(q if q.endswith("?") else q + "?")
@@ -1200,8 +1206,8 @@ class AnalystAgent:
         suggestions = [self.cat.metrics[n].title for n in ([route.metric.name] if route.metric else []) + route.alternatives
                        if n in self.cat.metrics][:4]
         return AnalystAnswer(
-            "I could not match this to a built-in analysis, and custom queries need the language model"
-            + (" (not reachable right now)." if self.use_llm else ".")
+            "I could not match this to a built-in analysis, and other questions "
+            + ("can't be answered right now." if self.use_llm else "are switched off here.")
             + (" Closest analyses: " + "; ".join(suggestions) + "." if suggestions else ""),
             route="help")
 
@@ -1244,7 +1250,7 @@ class AnalystAgent:
             result = self._execute(checked.sql)
         except SourceError as exc:
             self._emit("verify", f"The database rejected the query: {str(exc)[:300]}", ok=False)
-            return AnalystAnswer(f"The {metric.title.lower()} query failed on the database ({str(exc)[:200]}). "
+            return AnalystAnswer(f"The {metric.title.lower()} could not be calculated just now. "
                                  "Try again, or narrow the period or apps.", route="error", source=source,
                                  resolved=metric.title, metric=metric.name, params=resolved,
                                  tables=checked.tables, sql=checked.sql, notes=notes, verified=False)
@@ -1381,7 +1387,8 @@ class AnalystAgent:
                 last_error = str(exc)
             else:
                 if result.rows:
-                    detail = why.removeprefix("OpenAI SQL review: ").rstrip(".")
+                    self._emit("verify", "Shown with a caution; the review said: "
+                                         + why.removeprefix("OpenAI SQL review: "), ok=False)
                     narrative = ""
                     if narrate and self.use_llm and not _RUN.get().budget.no_llm:
                         narrative = self._narrate(question, result, notes)[0]
@@ -1389,13 +1396,13 @@ class AnalystAgent:
                                                max_lines=50 if strict_deep else 10)
                     body = f"{narrative}\n\n{table_text}" if narrative else table_text
                     return AnalystAnswer(
-                        f"**Check before relying on this.** The review flagged: {detail}.\n\n{body}",
+                        "**Check before relying on this.** An automatic check raised a doubt about how this was calculated.\n\n" + body,
                         route="sql", source="llm", resolved="custom query", tables=checked.tables,
-                        sql=checked.sql, table=result.as_table(), notes=notes + [f"Review: {detail}."],
+                        sql=checked.sql, table=result.as_table(), notes=notes,
                         verified=False, state={"tables": checked.tables, "sql": checked.sql})
-        return AnalystAnswer(f"I could not write a valid query for this ({last_error}). Try rephrasing, or ask "
-                             "about a specific app, metric or time range.", route="error", source="llm",
-                             tables=tables)
+        self._emit("verify", f"No usable query: {last_error[:300]}", ok=False)
+        return AnalystAnswer("I could not calculate this reliably. Try rephrasing, or ask about a specific app, "
+                             "measure or period.", route="error", source="llm", tables=tables)
 
     def _compare(self, question: str, result: AnalystAnswer) -> None:
         """Comparison questions: computed comparison facts and a written verdict above the rows."""
@@ -1561,9 +1568,11 @@ class AnalystAgent:
         timed_out = None
         interpretation = ""
         if config.LLM_PROVIDER != "openai":
+            self._emit("plan", "Deep analysis needs the OpenAI provider: select OpenAI in Connection settings",
+                       ok=False)
             return AnalystAnswer(
-                "Deep analysis requires the OpenAI provider. Select OpenAI in Connection settings, "
-                "test the connection, and try again.", route="error", source="rules", resolved=question,
+                "Deep analysis is not available with the current setup. Ask one question at a time, or ask "
+                "whoever runs this assistant to turn it on.", route="error", source="rules", resolved=question,
                 depth="deep", verified=False)
         try:
             if given_parts:
@@ -1668,8 +1677,6 @@ class AnalystAgent:
                     sub = self._answer_one(part, history, {}, openai_route, allow_narrative=False,
                                            original=original)
                 self._compare(part, sub)
-                if interpretation and len(parts) == 1:
-                    sub.notes.insert(0, f"Interpreted as: {interpretation}")
                 return self._verify_part(part, sub, history, interpretation, custom_tables.get(part),
                                          strict=part in custom_tables)
 
@@ -1822,11 +1829,7 @@ class AnalystAgent:
             if sub.verified:
                 return parts_lib.Outcome("answered", sub, question=question)
             if not sub.answer.startswith("**Check before relying on this."):
-                issues = [n.removeprefix("OpenAI verification: ") for n in sub.notes
-                          if n.startswith("OpenAI verification: ")]
-                sub.answer = ("**Check before relying on this.** The review flagged: "
-                              + ("; ".join(i.rstrip(".") for i in issues[:2]) if issues else "a possible mismatch")
-                              + ".\n\n" + sub.answer)
+                sub.answer = "**Check before relying on this.** An automatic check raised a doubt about how this was calculated.\n\n" + sub.answer
             return parts_lib.Outcome("flagged", sub, question=question)
         if sub.route in ("metric", "sql") and sub.table is not None:
             return parts_lib.Outcome("no_rows", sub, question=question)
@@ -1907,9 +1910,9 @@ class AnalystAgent:
                 continue          # already carries its own, more specific warning
             issues = [n.removeprefix("OpenAI verification: ") for n in r.notes
                       if n.startswith("OpenAI verification: ")]
-            r.answer = ("**Check before relying on this.** OpenAI's review flagged: "
-                        + ("; ".join(issue.rstrip(".") for issue in issues[:2]) if issues else "a possible mismatch")
-                        + ".\n\n" + r.answer)
+            self._emit("verify", "Shown with a caution; the review said: " + ("; ".join(issues[:2]) or "a possible "
+                                                                                       "mismatch"), ok=False)
+            r.answer = "**Check before relying on this.** An automatic check raised a doubt about how this was calculated.\n\n" + r.answer
         if len(parts) == 1 and len(good) == 1 and not cannot and not timed_out:
             answer = good[0][1]
             answer.depth = "deep"
@@ -1953,8 +1956,7 @@ class AnalystAgent:
             table=first.table if first else None, timed_out=bool(timed_out), depth="deep",
             verified=bool(good) and not (cannot or failed or timed_out),
             # A single part carries the interpretation in its own notes; several parts share this one.
-            notes=(([f"Interpreted as: {interpretation}"] if interpretation and len(parts) > 1 else [])
-                   + [f"cannot answer: {c['part']}" for c in cannot]
+            notes=([f"cannot answer: {c['part']}" for c in cannot]
                    + [f"not verified: {part}" for part in failed]
                    + (["analysis timed out before completion"] if timed_out else [])),
             state=first.state if len(good) == 1 and first else {},
@@ -2264,13 +2266,12 @@ class AnalystAgent:
         return results
 
     def _part_error(self, exc: BaseException) -> AnalystAnswer:
-        if isinstance(exc, llm.OllamaError):
-            text = f"The language model was not reachable for this part ({exc})."
-        elif isinstance(exc, SourceError):
-            text = f"The database rejected this part ({str(exc)[:200]})."
+        log.warning("part failed: %s", exc, exc_info=not isinstance(exc, (llm.OllamaError, SourceError)))
+        self._emit("verify", f"A part failed: {type(exc).__name__}: {str(exc)[:300]}", ok=False)
+        if isinstance(exc, SourceError):
+            text = "The data for this part could not be read just now."
         else:
-            log.error("part failed", exc_info=exc)
-            text = "This part failed with an internal error."
+            text = "This part could not be analysed just now."
         return AnalystAnswer(text, route="error", verified=False)
 
     def _adopt_home(self, question: str, state: dict, run: _Run):

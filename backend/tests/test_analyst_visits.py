@@ -73,7 +73,7 @@ def test_total_visits_answer_offline():
 def test_database_error_in_vetted_metric_is_an_answer_not_a_crash():
     result = make_agent(VisitSource(fail=True)).ask("total visits", depth="fast")
     assert result.route == "error" and not result.verified
-    assert "failed on the database" in result.answer
+    assert "could not be calculated just now" in result.answer and "statement timeout" not in result.answer
 
 
 def _deep_model(plan: dict):
@@ -101,7 +101,8 @@ def test_deep_falls_back_to_vetted_metric_when_no_custom_query_is_approved():
         result = agent.ask("how many total user visit?", depth="deep", max_seconds=120)
     assert result.metric == "visits_overview" and result.verified, result.answer
     assert result.resolved == reading["rephrased_question"], "'Understood as' shows OpenAI's rephrasing"
-    assert "Interpreted as: Visits are sessions" in result.answer
+    assert any("Visits are sessions" in s["text"] for s in result.thinking), "the interpretation is a step"
+    assert "Interpreted as" not in result.answer, "it names tables and columns: never in the answer text"
     assert any("closest vetted analysis" in step["text"] for step in result.thinking)
 
 
@@ -183,10 +184,11 @@ def test_auto_mode_without_openai_answers_each_part():
 def test_explicit_deep_without_openai_says_what_it_needs():
     with patch("config.LLM_PROVIDER", "ollama"):
         result = make_agent().ask(TWO_ASKS, depth="deep")
-    assert result.route == "error" and "requires the OpenAI provider" in result.answer
+    assert result.route == "error" and "Deep analysis is not available" in result.answer
+    assert any("select OpenAI in Connection settings" in s["text"] for s in result.thinking)
 
 
-def test_decomposed_deep_answer_shows_the_interpretation_once():
+def test_decomposed_deep_interpretation_is_a_thinking_step_not_answer_text():
     plan = {"action": "decompose", "parts": TWO_ASKS.replace("? ", "?|").split("|"), "reason": "two asks",
             "interpretation": "Visits are sessions in session_master, in total and per visit day."}
 
@@ -206,4 +208,5 @@ def test_decomposed_deep_answer_shows_the_interpretation_once():
     with patch("config.LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=complete):
         result = make_agent().ask(TWO_ASKS, depth="deep", max_seconds=120)
     assert result.route == "deep" and result.verified and len(result.parts) == 2, result.answer
-    assert result.answer.count("Interpreted as: Visits are sessions") == 1, result.answer
+    assert "Interpreted as" not in result.answer
+    assert sum("Visits are sessions in session_master" in s["text"] for s in result.thinking) == 1

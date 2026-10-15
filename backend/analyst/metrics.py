@@ -81,6 +81,10 @@ def resolve_params(metric: MetricDoc, given: dict, catalog: Catalog) -> dict:
             if not value:
                 continue
         out[p.name] = value
+    if "category" in out and ":category_subs" in metric.sql:
+        # A category asked by name ("Mobiles") is not inside any journey's sub-category ("Smartphones"):
+        # match its sub-categories from the live category tree too. Never empty, so the SQL stays valid.
+        out["category_subs"] = catalog.subcategories_of(out["category"]) or [out["category"]]
     required_missing = [p.name for p in metric.params
                         if p.name not in out and _required(metric, p.name)]
     if required_missing:

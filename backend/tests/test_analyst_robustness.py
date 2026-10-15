@@ -77,7 +77,8 @@ def test_running_out_of_time_shows_the_guard_approved_query_flagged():
             patch("llm.complete", side_effect=_deep(blocking, sql_calls=[])):
         result = make_agent().ask("day wise visits", depth="deep", max_seconds=60)
     assert result.table and result.table["rows"], result.answer
-    assert result.answer.startswith("**Check before relying on this.** The review flagged: category mapping")
+    assert result.answer.startswith("**Check before relying on this.** An automatic check raised a doubt")
+    assert any("category mapping relies on partial text matches" in s["text"] for s in result.thinking)
     assert not result.verified
     assert any("guard-approved" in s["text"] for s in result.thinking)
 
@@ -95,7 +96,8 @@ def test_an_unreadable_verification_marks_the_answer_unchecked():
             patch("llm.complete", side_effect=_deep(ok, verify="{oops")):
         result = make_agent().ask("day wise visits", depth="deep", max_seconds=60)
     assert result.table["rows"] and not result.verified
-    assert "unchecked" in result.answer
+    assert result.answer.startswith("**Check before relying on this.**")
+    assert any("unchecked" in s["text"] for s in result.thinking)
 
 
 def test_an_unusable_plan_says_why():
@@ -103,4 +105,5 @@ def test_an_unusable_plan_says_why():
         return json.dumps({"action": "custom_sql", "tables": ["no_such_table"], "reason": "r", "interpretation": "i"})
     with patch.object(config, "LLM_PROVIDER", "openai"), patch("llm.complete", side_effect=complete):
         result = make_agent().ask("day wise visits", depth="deep", max_seconds=60)
-    assert result.route == "error" and "did not select tables" in result.answer
+    assert result.route == "error" and "could not work out how to answer" in result.answer
+    assert any("did not select tables" in s["text"] for s in result.thinking)

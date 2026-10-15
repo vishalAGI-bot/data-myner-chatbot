@@ -10,12 +10,14 @@ interface Props {
   onBack: () => void;
   onMenu: () => void;
   onConnected: (report: ConnectionReport) => void;
+  /** The colour theme picker, shown in the header as on the chat page. */
+  themeControl?: ReactNode;
 }
 
 type Secret = "ssh_password" | "db_password" | "openai_api_key";
 const SSL_MODES = ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"];
 
-export default function SettingsPage({ health, onBack, onMenu, onConnected }: Props) {
+export default function SettingsPage({ health, onBack, onMenu, onConnected, themeControl }: Props) {
   const [view, setView] = useState<SettingsView | null>(null);
   const [form, setForm] = useState<SettingsValues | null>(null);
   const [useSsh, setUseSsh] = useState(true);
@@ -184,6 +186,7 @@ export default function SettingsPage({ health, onBack, onMenu, onConnected }: Pr
         <h1>Settings</h1>
         <p>Shared live data source for the data analyst and journey agent</p>
       </div>
+      {themeControl}
       <button type="button" className="new-chat" onClick={onBack}>Back to chat</button>
     </header>
   );

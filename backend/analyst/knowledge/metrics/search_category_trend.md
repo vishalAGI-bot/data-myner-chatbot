@@ -46,6 +46,8 @@ Shows the named category next to the 5 largest categories of the latest 7 days, 
 
 # Computation
 
+`category` keeps visible a sub-category name (search_category, partly) or every sub-category of a category or master category of that name (any case): `:category_subs` is filled from category_master. A sub-category name shared by several parents is not attributed to either.
+
 `[[ ... ]]` blocks are included only when every `:parameter` inside them has a value. `{{dimension}}` is replaced from the `dimensions` allow-list above.
 
 ```sql
@@ -68,7 +70,7 @@ top_categories AS (
 folded AS (
   SELECT d.day,
          CASE WHEN d.search_category = 'Uncategorised' OR t.search_category IS NOT NULL
-                   [[ OR d.search_category ILIKE '%' || :category || '%' ]]
+                   [[ OR d.search_category ILIKE '%' || :category || '%' OR d.search_category IN :category_subs ]]
               THEN d.search_category ELSE 'Other categories' END AS search_category,
          SUM(d.journeys) AS journeys
   FROM daily d

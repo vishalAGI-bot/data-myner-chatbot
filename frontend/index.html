@@ -3,7 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>DataMyner Intelligence</title>
+    <script>
+      /* The saved colour theme, applied before the first paint so a dark page never flashes light.
+         Same key and rules as src/theme.ts and src/view.ts (/ask keeps its own choice). */
+      (function () {
+        var choice = "system", device = false;
+        try {
+          var ask = location.pathname.replace(/\/+$/, "").toLowerCase().slice(-4) === "/ask";
+          choice = JSON.parse(localStorage.getItem("datamyner:theme:" + (ask ? "ask" : "work")) || '"system"');
+        } catch (e) { /* storage blocked: follow the device */ }
+        try { device = matchMedia("(prefers-color-scheme: dark)").matches; } catch (e) { /* light */ }
+        var dark = choice === "dark" || (choice !== "light" && device);
+        document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+      })();
+    </script>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23d9f99d'/><text x='16' y='22' font-family='Arial' font-weight='700' font-size='17' text-anchor='middle' fill='%23153a2e'>D</text></svg>" />
   </head>
   <body>

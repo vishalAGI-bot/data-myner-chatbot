@@ -39,8 +39,8 @@ Share of app sessions where the user switched to a competitor app within 5 minut
 
 ## Caveats
 
-The app and the visit day are taken from session_id (its start time); created_at is only the record load time and
-is never used as the visit date.
+The app and the visit day come from the session itself (when it started), never from the time the record was
+loaded.
 
 # Computation
 

@@ -84,7 +84,7 @@ chat's own message rather than spinning forever. Change `MIN_MS` in `src/compone
 to make it shorter. The working page at `/` has no splash and opens at once.
 
 `/ask` never names the language model, the provider, the agent, the tables or the SQL, has no sidebar
-and no settings, and always answers in plain language. Hand that link out; there is no control on the
+and no settings, and always answers in plain language. Every answer, question card, clarification and follow-up is written in business language on both pages - technical detail (thinking steps, SQL, tables) is shown only on `/` - and `backend/tests/test_ask_page.py` checks that across briefs, many-question messages and every kind of failure. While a question runs, `/ask` shows the same progress in plain words (“Answering question 3…”), and “How this was calculated” lists what was done (“Read the data 6 times; checked the figures 4 times”). It uses Auto depth with a 5-minute ceiling of its own (a long brief or a dozen questions fits; a quick question still answers in seconds) and never reads or changes the working page's saved settings. Hand that link out; there is no control on the
 page that leads back to `/`. Both pages are the same app and the same API, so nothing extra to deploy -
 the SPA fallback (`vite dev`, `vite preview`, and the nginx `try_files $uri /index.html` line in
 section 5) already serves it.
@@ -113,7 +113,7 @@ section 5) already serves it.
 * Follow-ups ("this user", "the second user", "what about Flipkart?", "why is it lower?") work because each chat
   is one session: the UI sends the history and the previous answers' results back, and a question that refers to
   an earlier turn is rewritten into a standalone one first. The rewritten question is shown as "Read as: ...".
-  **New chat** clears that memory.
+  **New chat** starts a fresh one; the previous chat stays in the history.
 * **Settings page** (sidebar → Connect live database / Connection settings): choose live PostgreSQL or the
   offline snapshot; SSH tunnel (password or key file, optional host-key pinning); database login, schema
   and SSL mode; "we/our" app, purchase window, time zone, query time limit, row limit; language model
@@ -125,6 +125,17 @@ section 5) already serves it.
 * **Live status**: every 15 s the UI pings the database; the sidebar shows "Live database · 12 ms" and
   the Settings page shows since when it is connected and the latest data date. On a live database, new
   apps, categories and the latest date are re-read every 5 minutes, so "today" and new apps just work.
+* **Chat history** (both pages, the **History** button): every conversation is saved with the date and time
+  of each message, grouped by day (Today, Yesterday, ...) and searchable. Opening one restores it, follow-ups
+  included, so it can be continued; a reload reopens the chat that was open. History is kept in the browser
+  (IndexedDB), so stopping or restarting the servers never removes it and it can be read while they are down;
+  only **Delete** / **Delete all history** in the panel removes it. `/` and `/ask` keep separate lists, and each
+  `/ask` reader sees only their own (`src/history.ts`).
+* **Theme** (both pages, the sun/moon button in the header): **Light**, **Dark**, or **System**, which follows
+  the device's setting and changes with it (the default). The choice is saved in the browser, `/` and `/ask` keep
+  their own, and it is applied before the page first draws, so a dark page never flashes white. Charts switch to
+  colours stepped for the dark card, and a downloaded chart matches the screen. Every colour is a token in
+  `src/styles.css`, so another theme is one more token block (`src/theme.ts`).
 * Works on phones (the sidebar becomes a slide-out menu).
 
 ## 5. Production build
